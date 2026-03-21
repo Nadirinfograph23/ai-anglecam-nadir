@@ -182,7 +182,11 @@ class HFClient:
                 delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
                 await asyncio.sleep(delay)
 
-        raise RuntimeError("Failed to upload image after all retries")
+        raise RuntimeError(
+            "Server error: Failed to upload image to the AI server (HuggingFace) after all retries. "
+            "This is not a problem with the app — the external server is temporarily unavailable. "
+            "Please try again later."
+        )
 
     async def generate_angle(
         self,
@@ -248,7 +252,9 @@ class HFClient:
                     await asyncio.sleep(delay)
 
         raise RuntimeError(
-            f"Generation failed after {MAX_RETRIES} attempts: {last_error}"
+            f"Server error: The AI generation server (HuggingFace) failed after {MAX_RETRIES} attempts. "
+            f"This is not a problem with the app — the external server is temporarily unavailable. "
+            f"Please try again later. Details: {last_error}"
         )
 
     async def _call_gradio_api(
@@ -344,6 +350,9 @@ class HFClient:
                     continue
                 try:
                     data = json.loads(data_str)
+                    # Capture error details from the SSE data
+                    if error_msg and isinstance(data, str):
+                        error_msg = f"API error: {data[:300]}"
                     if isinstance(data, list) and len(data) > 0:
                         first = data[0]
                         if isinstance(first, dict) and "url" in first:
@@ -351,6 +360,7 @@ class HFClient:
                 except (json.JSONDecodeError, TypeError, KeyError):
                     continue
 
+        logger.error("SSE response content: %s", text[:500])
         raise RuntimeError(error_msg or "No result image found in SSE response")
 
     async def generate_all_angles(
