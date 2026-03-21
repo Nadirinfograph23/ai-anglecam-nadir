@@ -17,10 +17,10 @@ DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 768
 
 # Retry configuration
-MAX_RETRIES = 4
+MAX_RETRIES = 5
 RETRY_BASE_DELAY = 3.0  # seconds
 RETRY_MAX_DELAY = 60.0  # seconds
-QUOTA_RETRY_DELAY = 30.0  # extra delay for quota/rate-limit errors
+QUOTA_RETRY_DELAY = 20.0  # extra delay for quota/rate-limit errors
 
 # Concurrency control - serialize to minimize quota usage
 MAX_CONCURRENT_GENERATIONS = 1

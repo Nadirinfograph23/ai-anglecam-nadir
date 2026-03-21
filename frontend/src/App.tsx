@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   Camera,
   Upload,
@@ -65,7 +65,21 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [cooldown, setCooldown] = useState(0);
+  const cooldownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Cooldown timer: prevent rapid-fire generation to conserve quota
+  useEffect(() => {
+    if (cooldown <= 0) {
+      if (cooldownRef.current) clearInterval(cooldownRef.current);
+      return;
+    }
+    cooldownRef.current = setInterval(() => {
+      setCooldown((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => { if (cooldownRef.current) clearInterval(cooldownRef.current); };
+  }, [cooldown > 0]);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -116,9 +130,16 @@ function App() {
         }
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Generation failed");
+      const msg = e instanceof Error ? e.message : "Generation failed";
+      if (msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("429")) {
+        setError("GPU quota exceeded. The app will automatically retry with a different token. Please wait a moment and try again.");
+      } else {
+        setError(msg);
+      }
     } finally {
       setIsGenerating(false);
+      // Start a 30-second cooldown to prevent rapid-fire usage
+      setCooldown(30);
     }
   };
 
@@ -270,13 +291,18 @@ function App() {
 
             <button
               onClick={generateAllAngles}
-              disabled={!imageFile || isGenerating}
+              disabled={!imageFile || isGenerating || cooldown > 0}
               className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
                   {"Generating... (" + progress.completed + "/" + progress.total + ")"}
+                </>
+              ) : cooldown > 0 ? (
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  {"Please wait... (" + cooldown + "s)"}
                 </>
               ) : (
                 <>

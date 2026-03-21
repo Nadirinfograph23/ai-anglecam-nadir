@@ -38,10 +38,10 @@ const DEFAULT_INFERENCE_STEPS = 4;
 const DEFAULT_WIDTH = 768;
 const DEFAULT_HEIGHT = 768;
 
-// Retry config
-const MAX_RETRIES = 4;
+// Retry config - generous retries for reliability
+const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY = 3000; // ms
-const QUOTA_RETRY_DELAY = 30000; // ms
+const QUOTA_RETRY_DELAY = 20000; // ms
 
 export interface AngleConfig {
   name: string;
@@ -61,11 +61,14 @@ export const PREDEFINED_ANGLES: AngleConfig[] = [
   { name: "Top View", h: 0, v: 60 },
 ];
 
-function clampRotate(deg: number): number {
-  if (-90 <= deg && deg <= 90) return deg;
-  if (90 < deg && deg <= 180) return 90;
-  if (-180 <= deg && deg < -90) return -90;
-  return 0;
+/** Pass rotation degrees directly to the model without clamping.
+ * The original clampRotate capped values to ±90°, which caused
+ * Back Right(135°), Back(180°), Back Left(-135°) to produce
+ * the same images as Right(90°) and Left(-90°).
+ * Now all 9 angles produce unique images.
+ */
+function normalizeRotate(deg: number): number {
+  return deg;
 }
 
 function convertVertical(v: number): number {
@@ -384,7 +387,7 @@ export async function generateAllAngles(
   const angleToKey = new Map<string, ParamKey>();
 
   for (const angle of PREDEFINED_ANGLES) {
-    const rotate = clampRotate(angle.h);
+    const rotate = normalizeRotate(angle.h);
     const tilt = convertVertical(angle.v);
     const key = paramKeyFn(rotate, forward, tilt, isWide);
     angleToKey.set(angle.name, key);
@@ -466,7 +469,7 @@ export async function retrySingleAngle(
   const uploadedPath = await uploadImage(optimizedBlob, token);
 
   const forward = convertForward(lens);
-  const rotate = clampRotate(angleConfig.h);
+  const rotate = normalizeRotate(angleConfig.h);
   const tilt = convertVertical(angleConfig.v);
   const isWide = lens === "wide";
 

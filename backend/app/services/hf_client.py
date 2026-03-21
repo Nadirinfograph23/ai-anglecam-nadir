@@ -76,13 +76,14 @@ def compute_image_hash(image_data: bytes) -> str:
 
 
 def clamp_rotate(deg: float) -> float:
-    if -90 <= deg <= 90:
-        return deg
-    if 90 < deg <= 180:
-        return 90.0
-    if -180 <= deg < -90:
-        return -90.0
-    return 0.0
+    """Pass rotation degrees directly without clamping.
+
+    The original implementation capped values to ±90°, which caused
+    Back Right(135°), Back(180°), Back Left(-135°) to produce
+    identical images to Right(90°) and Left(-90°).
+    Now passes the raw value so all 9 angles produce unique images.
+    """
+    return float(deg)
 
 
 def convert_vertical(v: float) -> float:
