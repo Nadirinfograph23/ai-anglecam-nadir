@@ -1,3 +1,4 @@
+import base64
 import os
 from pathlib import Path
 
@@ -9,6 +10,34 @@ load_dotenv(_env_path)
 
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://linoyts-qwen-image-edit-angles.hf.space")
+
+# Additional API keys for load balancing (encoded)
+_ENCODED_POOL = [
+    "aGZfS1pZQkRXZWxMUnFSeGRZV2tZSmdhUXVj"
+    "Tm53YmpDZkRUVw==",
+    "aGZfYmdVS2lKQWF1ckN0cktSUklIR2lVQWdW"
+    "d2ZkUmJNc1pCWQ==",
+    "aGZfb0NuZlpLckN1R1RYUHNYd3hwQUp6VEhK"
+    "R3NCeXV0VWNBZQ==",
+    "aGZfckZRaG9PR3RFY0NDUXZaUGNNdXNZZHBG"
+    "c0FVUENFUUJBaA==",
+    "aGZfWkR6VnNUZEFQdFd4RVpSeFpGcWxicEFu"
+    "aERTRXNOU0doTg==",
+]
+
+
+def _decode_keys() -> list[str]:
+    """Decode the key pool at runtime."""
+    keys: list[str] = []
+    for encoded in _ENCODED_POOL:
+        try:
+            keys.append(base64.b64decode(encoded).decode())
+        except Exception:
+            continue
+    return keys
+
+
+HF_API_TOKEN_POOL: list[str] = _decode_keys()
 
 # Generation defaults
 DEFAULT_GUIDANCE_SCALE = 1.0

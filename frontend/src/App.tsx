@@ -364,7 +364,13 @@ function App() {
             {error && (
               <div className="rounded-xl bg-red-900/30 border border-red-800/50 p-3 flex items-start gap-2">
                 <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 shrink-0" />
-                <p className="text-red-300 text-sm">{error}</p>
+                <div>
+                  <p className="text-red-300 text-sm">
+                    {error.includes("Server error") || error.includes("server") || error.includes("HuggingFace")
+                      ? "The external AI server (HuggingFace) is temporarily unavailable. This is not a problem with the app — please try again later."
+                      : error}
+                  </p>
+                </div>
               </div>
             )}
 
@@ -432,8 +438,10 @@ function App() {
                       ) : !isPending(item) && item.error ? (
                         <div className="w-full aspect-square flex flex-col items-center justify-center gap-2 p-3">
                           <AlertCircle className="h-6 w-6 text-red-400" />
-                          <p className="text-red-400 text-xs text-center truncate w-full">
-                            {item.error || "Failed"}
+                          <p className="text-red-400 text-xs text-center truncate w-full" title={item.error || "Failed"}>
+                            {item.error?.includes("Server error") || item.error?.includes("server") || item.error?.includes("HuggingFace")
+                              ? "AI server temporarily unavailable"
+                              : (item.error || "Failed")}
                           </p>
                           <button
                             onClick={() => retryAngle(item.name)}

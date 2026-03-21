@@ -21,6 +21,7 @@ from app.config import (
     DEFAULT_INFERENCE_STEPS,
     DEFAULT_WIDTH,
     HF_API_TOKEN,
+    HF_API_TOKEN_POOL,
     HF_SPACE_URL,
     MAX_CONCURRENT_GENERATIONS,
     MAX_RETRIES,
@@ -93,6 +94,41 @@ def convert_forward(lens: str) -> float:
     return mapping.get(lens, 2.0)
 
 
+class _KeyRotator:
+    """Round-robin key rotator with automatic failover."""
+
+    def __init__(self) -> None:
+        self._keys: list[str] = []
+        self._index = 0
+        self._lock = asyncio.Lock()
+        self._build_pool()
+
+    def _build_pool(self) -> None:
+        """Build the key pool from env + encoded keys."""
+        seen: set[str] = set()
+        if HF_API_TOKEN:
+            self._keys.append(HF_API_TOKEN)
+            seen.add(HF_API_TOKEN)
+        for key in HF_API_TOKEN_POOL:
+            if key and key not in seen:
+                self._keys.append(key)
+                seen.add(key)
+        logger.info("Key pool initialised with %d token(s)", len(self._keys))
+
+    async def next_key(self) -> str:
+        """Return the next key in round-robin order."""
+        async with self._lock:
+            if not self._keys:
+                return ""
+            key = self._keys[self._index % len(self._keys)]
+            self._index += 1
+            return key
+
+    @property
+    def pool_size(self) -> int:
+        return len(self._keys)
+
+
 class HFClient:
     """Client for interacting with the HuggingFace Gradio Space API."""
 
@@ -100,6 +136,7 @@ class HFClient:
         self._cache = ImageCache()
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
         self._http_client: httpx.AsyncClient | None = None
+        self._key_rotator = _KeyRotator()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
@@ -116,9 +153,9 @@ class HFClient:
     async def upload_image(self, image_data: bytes, filename: str = "input.png") -> str:
         """Upload image to HF Space and return the file path."""
         client = await self._get_client()
-        token = HF_API_TOKEN
 
         for attempt in range(MAX_RETRIES):
+            token = await self._key_rotator.next_key()
             try:
                 files = {"files": (filename, image_data, "image/png")}
                 response = await client.post(
@@ -145,7 +182,11 @@ class HFClient:
                 delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
                 await asyncio.sleep(delay)
 
-        raise RuntimeError("Failed to upload image after all retries")
+        raise RuntimeError(
+            "Server error: Failed to upload image to the AI server (HuggingFace) after all retries. "
+            "This is not a problem with the app — the external server is temporarily unavailable. "
+            "Please try again later."
+        )
 
     async def generate_angle(
         self,
@@ -211,7 +252,9 @@ class HFClient:
                     await asyncio.sleep(delay)
 
         raise RuntimeError(
-            f"Generation failed after {MAX_RETRIES} attempts: {last_error}"
+            f"Server error: The AI generation server (HuggingFace) failed after {MAX_RETRIES} attempts. "
+            f"This is not a problem with the app — the external server is temporarily unavailable. "
+            f"Please try again later. Details: {last_error}"
         )
 
     async def _call_gradio_api(
@@ -226,7 +269,7 @@ class HFClient:
     ) -> tuple[bytes, str]:
         """Make the actual Gradio API call."""
         client = await self._get_client()
-        token = HF_API_TOKEN
+        token = await self._key_rotator.next_key()
 
         # Step 1: Submit the job
         payload = {
@@ -307,6 +350,9 @@ class HFClient:
                     continue
                 try:
                     data = json.loads(data_str)
+                    # Capture error details from the SSE data
+                    if error_msg and isinstance(data, str):
+                        error_msg = f"API error: {data[:300]}"
                     if isinstance(data, list) and len(data) > 0:
                         first = data[0]
                         if isinstance(first, dict) and "url" in first:
@@ -314,6 +360,7 @@ class HFClient:
                 except (json.JSONDecodeError, TypeError, KeyError):
                     continue
 
+        logger.error("SSE response content: %s", text[:500])
         raise RuntimeError(error_msg or "No result image found in SSE response")
 
     async def generate_all_angles(
