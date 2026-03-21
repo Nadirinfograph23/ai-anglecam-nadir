@@ -131,13 +131,21 @@ def convert_forward(lens: str) -> float:
     return mapping.get(lens, 2.0)
 
 
-def _is_quota_error(status_code: int, response_text: str) -> bool:
-    """Detect if an API error is quota/rate-limit related."""
-    if status_code in (429, 503):
-        return True
+def _is_quota_error_by_status(status_code: int) -> bool:
+    """Check if an HTTP status code indicates a quota/rate-limit error."""
+    return status_code in (429, 503)
+
+
+def _is_quota_error_by_text(response_text: str) -> bool:
+    """Check if response text contains quota/rate-limit related keywords."""
     quota_keywords = ["quota", "rate limit", "too many requests", "exceeded", "throttl"]
     lower_text = response_text.lower()
     return any(kw in lower_text for kw in quota_keywords)
+
+
+def _is_quota_error(status_code: int, response_text: str) -> bool:
+    """Detect if an API error is quota/rate-limit related."""
+    return _is_quota_error_by_status(status_code) or _is_quota_error_by_text(response_text)
 
 
 def _parse_retry_after(response_headers: httpx.Headers) -> float | None:
@@ -439,7 +447,7 @@ class HFClient:
                     # Check for quota error in data
                     if isinstance(data, dict) and "error" in data:
                         error_text = str(data["error"])
-                        if _is_quota_error(429, error_text):
+                        if _is_quota_error_by_text(error_text):
                             raise QuotaExceededError(f"API quota error: {error_text}")
                     if isinstance(data, list) and len(data) > 0:
                         first = data[0]
