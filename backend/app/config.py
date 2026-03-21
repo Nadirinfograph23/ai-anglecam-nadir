@@ -46,6 +46,18 @@ GITHUB_RAW_REPO = os.getenv("GITHUB_RAW_REPO", "")  # e.g., "owner/repo"
 GITHUB_RAW_TOKEN = os.getenv("GITHUB_RAW_TOKEN", "")
 GITHUB_RAW_BRANCH = os.getenv("GITHUB_RAW_BRANCH", "generated-images")
 
+# Replicate API (secondary fallback)
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "r8_dummy_replicate_token")
+REPLICATE_MODEL = os.getenv(
+    "REPLICATE_MODEL",
+    "stability-ai/stable-diffusion:db21e45d3f7023abc2a46ee38a23973f6dce16bb082a930b0c49861f96d1e5bf",
+)
+
+# Stable Horde API (tertiary fallback)
+STABLE_HORDE_API_KEY = os.getenv("STABLE_HORDE_API_KEY", "0000000000")
+STABLE_HORDE_API_URL = "https://stablehorde.net/api/v2"
+STABLE_HORDE_MODEL = os.getenv("STABLE_HORDE_MODEL", "stable_diffusion")
+
 # The 9 predefined camera angles
 PREDEFINED_ANGLES = [
     {"name": "Front", "h": 0, "v": 0},

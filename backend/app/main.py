@@ -185,14 +185,23 @@ async def generate_stream(
         try:
             uploaded_path = await hf_client.upload_image(optimized)
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Upload failed: {str(e)}'})}\n\n"
-            return
+            # Upload to HF failed — if fallbacks are available, we still proceed
+            logger.warning("HF upload failed, will rely on fallback APIs: %s", str(e))
+            uploaded_path = ""
 
         forward = convert_forward(lens)
         completed = 0
         total = len(PREDEFINED_ANGLES)
 
         yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
+
+        # If HF upload failed, only proceed if fallback APIs are available
+        if not uploaded_path:
+            status = hf_client.get_status()
+            has_fallback = status.get("fallback_apis", {}).get("replicate") or status.get("fallback_apis", {}).get("stable_horde")
+            if not has_fallback:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Upload failed and no fallback APIs available'})}\n\n"
+                return
 
         # Create all tasks with angle name tracking
         pending_tasks = {}
@@ -207,6 +216,7 @@ async def generate_stream(
                     move_forward=forward,
                     vertical_tilt=tilt,
                     wideangle=(lens == "wide"),
+                    image_data_for_fallback=optimized,
                 )
             )
             pending_tasks[task] = angle["name"]
@@ -223,7 +233,9 @@ async def generate_stream(
                 try:
                     img_bytes, content_type = task.result()
                     b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
+                    api_used = hf_client._last_api_used
+                    logger.info("Angle '%s' generated via %s", angle_name, api_used)
+                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total, 'api': api_used})}\n\n"
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
 

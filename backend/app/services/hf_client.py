@@ -1,4 +1,4 @@
-"""HuggingFace Gradio Space client with retries, caching, multi-token fallback, and queue."""
+"""HuggingFace Gradio Space client with retries, caching, multi-token fallback, queue, and API fallbacks."""
 
 import asyncio
 import base64
@@ -28,8 +28,13 @@ from app.config import (
     MAX_CONCURRENT_GENERATIONS,
     MAX_QUEUE_SIZE,
     MAX_RETRIES,
+    REPLICATE_API_TOKEN,
+    REPLICATE_MODEL,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
+    STABLE_HORDE_API_KEY,
+    STABLE_HORDE_API_URL,
+    STABLE_HORDE_MODEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -187,14 +192,246 @@ def convert_forward(lens: str) -> float:
     return mapping.get(lens, 2.0)
 
 
+# ---------------------------------------------------------------------------
+# Fallback API providers
+# ---------------------------------------------------------------------------
+
+class ReplicateProvider:
+    """Secondary fallback: Replicate API for image generation."""
+
+    def __init__(self, token: str = REPLICATE_API_TOKEN, model: str = REPLICATE_MODEL) -> None:
+        self.token = token
+        self.model = model
+        self.name = "replicate"
+        self._available = bool(token and token != "r8_dummy_replicate_token")
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    async def generate(
+        self,
+        client: httpx.AsyncClient,
+        image_b64: str,
+        prompt: str,
+        rotate_deg: float,
+    ) -> tuple[bytes, str]:
+        """Generate image via Replicate API."""
+        logger.info("[replicate] Attempting generation with prompt: %s", prompt[:80])
+
+        # Create prediction
+        response = await client.post(
+            "https://api.replicate.com/v1/predictions",
+            json={
+                "version": self.model.split(":")[-1] if ":" in self.model else self.model,
+                "input": {
+                    "prompt": prompt,
+                    "image": f"data:image/png;base64,{image_b64}",
+                    "num_outputs": 1,
+                    "guidance_scale": 7.5,
+                    "num_inference_steps": 25,
+                },
+            },
+            headers={
+                "Authorization": f"Token {self.token}",
+                "Content-Type": "application/json",
+            },
+            timeout=30.0,
+        )
+
+        if response.status_code != 201:
+            raise RuntimeError(f"Replicate submit failed: {response.status_code} {response.text[:200]}")
+
+        prediction = response.json()
+        prediction_id = prediction.get("id")
+        if not prediction_id:
+            raise RuntimeError("No prediction ID from Replicate")
+
+        # Poll for completion (max 120s)
+        for _ in range(60):
+            await asyncio.sleep(2)
+            poll = await client.get(
+                f"https://api.replicate.com/v1/predictions/{prediction_id}",
+                headers={"Authorization": f"Token {self.token}"},
+                timeout=15.0,
+            )
+            if poll.status_code != 200:
+                continue
+            data = poll.json()
+            status = data.get("status")
+            if status == "succeeded":
+                output = data.get("output")
+                if isinstance(output, list) and output:
+                    img_url = output[0]
+                elif isinstance(output, str):
+                    img_url = output
+                else:
+                    raise RuntimeError("Unexpected Replicate output format")
+                # Download the image
+                img_resp = await client.get(img_url, timeout=30.0)
+                if img_resp.status_code == 200:
+                    ct = img_resp.headers.get("content-type", "image/png")
+                    logger.info("[replicate] Generation succeeded")
+                    return img_resp.content, ct
+                raise RuntimeError(f"Failed to download Replicate result: {img_resp.status_code}")
+            elif status == "failed":
+                raise RuntimeError(f"Replicate generation failed: {data.get('error', 'unknown')}")
+            elif status == "canceled":
+                raise RuntimeError("Replicate generation was canceled")
+
+        raise RuntimeError("Replicate generation timed out")
+
+
+class StableHordeProvider:
+    """Tertiary fallback: Stable Horde (free, community-powered)."""
+
+    def __init__(
+        self,
+        api_key: str = STABLE_HORDE_API_KEY,
+        api_url: str = STABLE_HORDE_API_URL,
+        model: str = STABLE_HORDE_MODEL,
+    ) -> None:
+        self.api_key = api_key
+        self.api_url = api_url
+        self.model = model
+        self.name = "stable_horde"
+        self._available = bool(api_key)  # Even anonymous key "0000000000" works
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    async def generate(
+        self,
+        client: httpx.AsyncClient,
+        image_b64: str,
+        prompt: str,
+        rotate_deg: float,
+    ) -> tuple[bytes, str]:
+        """Generate image via Stable Horde API."""
+        logger.info("[stable_horde] Attempting generation with prompt: %s", prompt[:80])
+
+        # img2img via Stable Horde
+        payload = {
+            "prompt": prompt,
+            "params": {
+                "sampler_name": "k_euler",
+                "cfg_scale": 7.5,
+                "denoising_strength": 0.6,
+                "height": 512,
+                "width": 512,
+                "steps": 20,
+                "n": 1,
+            },
+            "nsfw": False,
+            "models": [self.model],
+            "source_image": image_b64,
+            "source_processing": "img2img",
+            "r2": True,
+        }
+
+        response = await client.post(
+            f"{self.api_url}/generate/async",
+            json=payload,
+            headers={
+                "apikey": self.api_key,
+                "Content-Type": "application/json",
+            },
+            timeout=30.0,
+        )
+
+        if response.status_code != 202:
+            raise RuntimeError(f"Stable Horde submit failed: {response.status_code} {response.text[:200]}")
+
+        job_id = response.json().get("id")
+        if not job_id:
+            raise RuntimeError("No job ID from Stable Horde")
+
+        # Poll for completion (max 180s — Horde can be slow with anonymous key)
+        for _ in range(90):
+            await asyncio.sleep(2)
+            poll = await client.get(
+                f"{self.api_url}/generate/check/{job_id}",
+                headers={"apikey": self.api_key},
+                timeout=15.0,
+            )
+            if poll.status_code != 200:
+                continue
+            data = poll.json()
+            if data.get("done"):
+                # Fetch the result
+                result_resp = await client.get(
+                    f"{self.api_url}/generate/status/{job_id}",
+                    headers={"apikey": self.api_key},
+                    timeout=30.0,
+                )
+                if result_resp.status_code != 200:
+                    raise RuntimeError(f"Stable Horde status fetch failed: {result_resp.status_code}")
+
+                generations = result_resp.json().get("generations", [])
+                if not generations:
+                    raise RuntimeError("No generations returned from Stable Horde")
+
+                img_data = generations[0].get("img")
+                if not img_data:
+                    raise RuntimeError("No image data in Stable Horde response")
+
+                # img_data can be a URL (r2=True) or base64
+                if img_data.startswith("http"):
+                    img_resp = await client.get(img_data, timeout=30.0)
+                    if img_resp.status_code == 200:
+                        ct = img_resp.headers.get("content-type", "image/webp")
+                        logger.info("[stable_horde] Generation succeeded")
+                        return img_resp.content, ct
+                    raise RuntimeError(f"Failed to download Horde image: {img_resp.status_code}")
+                else:
+                    # Base64 encoded image
+                    img_bytes = base64.b64decode(img_data)
+                    logger.info("[stable_horde] Generation succeeded (base64)")
+                    return img_bytes, "image/webp"
+
+            if data.get("faulted"):
+                raise RuntimeError("Stable Horde generation faulted")
+
+        raise RuntimeError("Stable Horde generation timed out")
+
+
+def _make_angle_prompt(rotate_deg: float, vertical_tilt: float, wideangle: bool) -> str:
+    """Build a text prompt describing the desired camera angle for fallback APIs."""
+    parts = ["Rotate the camera view of this object"]
+    if abs(rotate_deg) < 5:
+        parts.append("from the front")
+    elif rotate_deg > 0:
+        parts.append(f"by {rotate_deg:.0f} degrees to the right")
+    else:
+        parts.append(f"by {abs(rotate_deg):.0f} degrees to the left")
+
+    if abs(vertical_tilt) > 0.1:
+        if vertical_tilt > 0:
+            parts.append("looking down from above")
+        else:
+            parts.append("looking up from below")
+
+    if wideangle:
+        parts.append("with a wide-angle lens")
+
+    parts.append(". Keep the same object, same style, same lighting. Photorealistic.")
+    return " ".join(parts)
+
+
 class HFClient:
-    """Client for interacting with the HuggingFace Gradio Space API."""
+    """Client for interacting with the HuggingFace Gradio Space API with fallback providers."""
 
     def __init__(self) -> None:
         self._cache = ImageCache()
         self._token_rotator = TokenRotator(HF_API_TOKENS)
         self._job_queue = JobQueue()
         self._http_client: httpx.AsyncClient | None = None
+        # Fallback providers
+        self._replicate = ReplicateProvider()
+        self._stable_horde = StableHordeProvider()
+        # Track which API was used per request (for logging)
+        self._last_api_used: str = "huggingface"
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
@@ -215,6 +452,11 @@ class HFClient:
             "queue_pending": self._job_queue.pending,
             "queue_max": self._job_queue.max_size,
             "token_count": self._token_rotator.token_count,
+            "last_api_used": self._last_api_used,
+            "fallback_apis": {
+                "replicate": self._replicate.available,
+                "stable_horde": self._stable_horde.available,
+            },
         }
 
     async def upload_image(self, image_data: bytes, filename: str = "input.png") -> str:
@@ -266,6 +508,7 @@ class HFClient:
         wideangle: bool,
         seed: int = 0,
         randomize_seed: bool = True,
+        image_data_for_fallback: bytes | None = None,
     ) -> tuple[bytes, str]:
         """Generate a single angle image. Returns (image_bytes, content_type)."""
         # Check cache first
@@ -275,6 +518,9 @@ class HFClient:
                         image_hash, rotate_deg, move_forward, vertical_tilt, wideangle)
             return cached.data, cached.content_type
 
+        # Use stored optimized data as fallback if not explicitly provided
+        fallback_data = image_data_for_fallback or getattr(self, "_current_optimized_data", None)
+
         # Acquire queue slot with concurrency control
         acquired = await self._job_queue.acquire()
         if not acquired:
@@ -283,7 +529,8 @@ class HFClient:
         try:
             return await self._generate_with_retry(
                 uploaded_path, image_hash, rotate_deg, move_forward,
-                vertical_tilt, wideangle, seed, randomize_seed
+                vertical_tilt, wideangle, seed, randomize_seed,
+                image_data_for_fallback=fallback_data,
             )
         finally:
             self._job_queue.release()
@@ -298,10 +545,12 @@ class HFClient:
         wideangle: bool,
         seed: int,
         randomize_seed: bool,
+        image_data_for_fallback: bytes | None = None,
     ) -> tuple[bytes, str]:
-        """Generate with retry logic and token rotation."""
+        """Generate with retry logic, token rotation, and API fallback chain."""
         last_error: Exception | None = None
 
+        # --- Phase 1: Try HuggingFace (primary) ---
         for attempt in range(MAX_RETRIES):
             token = await self._token_rotator.get_token()
             try:
@@ -310,6 +559,8 @@ class HFClient:
                     vertical_tilt, wideangle, seed, randomize_seed,
                     token=token,
                 )
+                self._last_api_used = "huggingface"
+                logger.info("[huggingface] Generation succeeded for rotate=%.1f", rotate_deg)
                 # Cache the result
                 self._cache.put(
                     image_hash, rotate_deg, move_forward, vertical_tilt, wideangle,
@@ -331,7 +582,7 @@ class HFClient:
                 last_error = e
                 error_str = str(e)
                 logger.warning(
-                    "Generation attempt %d/%d failed for rotate=%.1f: %s",
+                    "[huggingface] Attempt %d/%d failed for rotate=%.1f: %s",
                     attempt + 1, MAX_RETRIES, rotate_deg, error_str
                 )
                 # Rotate token on rate limit or auth errors
@@ -344,9 +595,78 @@ class HFClient:
                     logger.info("Retrying in %.1f seconds...", delay)
                     await asyncio.sleep(delay)
 
+        # --- Phase 2: Try fallback APIs if HF exhausted ---
+        if image_data_for_fallback:
+            result = await self._try_fallback_apis(
+                image_data_for_fallback, image_hash,
+                rotate_deg, move_forward, vertical_tilt, wideangle,
+            )
+            if result:
+                return result
+
         raise RuntimeError(
-            f"Generation failed after {MAX_RETRIES} attempts: {last_error}"
+            f"Generation failed on all APIs after {MAX_RETRIES} HF attempts: {last_error}"
         )
+
+    async def _try_fallback_apis(
+        self,
+        image_data: bytes,
+        image_hash: str,
+        rotate_deg: float,
+        move_forward: float,
+        vertical_tilt: float,
+        wideangle: bool,
+    ) -> tuple[bytes, str] | None:
+        """Try Replicate then Stable Horde as fallback APIs."""
+        client = await self._get_client()
+        image_b64 = base64.b64encode(image_data).decode("utf-8")
+        prompt = _make_angle_prompt(rotate_deg, vertical_tilt, wideangle)
+
+        # Try Replicate (secondary)
+        if self._replicate.available:
+            try:
+                logger.info("[fallback] Trying Replicate for rotate=%.1f", rotate_deg)
+                result = await self._replicate.generate(client, image_b64, prompt, rotate_deg)
+                self._last_api_used = "replicate"
+                # Cache the result
+                self._cache.put(
+                    image_hash, rotate_deg, move_forward, vertical_tilt, wideangle,
+                    result[0], result[1]
+                )
+                if GITHUB_RAW_REPO and GITHUB_RAW_TOKEN:
+                    asyncio.create_task(
+                        self._save_to_github(
+                            image_hash, rotate_deg, move_forward,
+                            vertical_tilt, wideangle, result[0], result[1]
+                        )
+                    )
+                return result
+            except Exception as e:
+                logger.warning("[replicate] Fallback failed: %s", str(e))
+
+        # Try Stable Horde (tertiary)
+        if self._stable_horde.available:
+            try:
+                logger.info("[fallback] Trying Stable Horde for rotate=%.1f", rotate_deg)
+                result = await self._stable_horde.generate(client, image_b64, prompt, rotate_deg)
+                self._last_api_used = "stable_horde"
+                # Cache the result
+                self._cache.put(
+                    image_hash, rotate_deg, move_forward, vertical_tilt, wideangle,
+                    result[0], result[1]
+                )
+                if GITHUB_RAW_REPO and GITHUB_RAW_TOKEN:
+                    asyncio.create_task(
+                        self._save_to_github(
+                            image_hash, rotate_deg, move_forward,
+                            vertical_tilt, wideangle, result[0], result[1]
+                        )
+                    )
+                return result
+            except Exception as e:
+                logger.warning("[stable_horde] Fallback failed: %s", str(e))
+
+        return None
 
     async def _call_gradio_api(
         self,
@@ -524,6 +844,8 @@ class HFClient:
 
         # Upload once, reuse for all angles
         uploaded_path = await self.upload_image(optimized)
+        # Keep optimized data for fallback APIs
+        self._current_optimized_data = optimized
 
         forward = convert_forward(lens)
 
@@ -592,7 +914,7 @@ class HFClient:
                 wideangle=wideangle,
             )
             if progress_queue:
-                await progress_queue.put({"name": angle_name, "status": "completed"})
+                await progress_queue.put({"name": angle_name, "status": "completed", "api": self._last_api_used})
             return result
         except Exception as e:
             if progress_queue:
