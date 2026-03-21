@@ -11,16 +11,12 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
-
-interface AngleResult {
-  name: string;
-  success: boolean;
-  image_data?: string;
-  content_type?: string;
-  error?: string;
-}
+import {
+  generateAllAngles as hfGenerateAllAngles,
+  retrySingleAngle,
+  PREDEFINED_ANGLES,
+} from "./services/hfClient";
+import type { AngleResult } from "./services/hfClient";
 
 interface PendingAngle {
   name: string;
@@ -30,10 +26,7 @@ interface PendingAngle {
 
 type GridItem = AngleResult | PendingAngle;
 
-const ANGLE_NAMES = [
-  "Front", "Front Right", "Right", "Back Right", "Back",
-  "Back Left", "Left", "Front Left", "Top View",
-];
+const ANGLE_NAMES = PREDEFINED_ANGLES.map((a) => a.name);
 
 const ANGLE_LABELS: Record<string, string> = {
   Front: "Front View",
@@ -101,63 +94,14 @@ function App() {
     setResults([]);
     setProgress({ completed: 0, total: 9 });
 
-    const formData = new FormData();
-    formData.append("image", imageFile);
-    formData.append("lens", lens);
-
     try {
-      const response = await fetch(API_URL + "/api/generate-stream", {
-        method: "POST",
-        body: formData,
+      await hfGenerateAllAngles(imageFile, lens, (result, completed, total) => {
+        setResults((prev) => {
+          const existing = prev.filter((r) => r.name !== result.name);
+          return [...existing, result];
+        });
+        setProgress({ completed, total });
       });
-
-      if (!response.ok) {
-        const errData = await response.json().catch(() => null);
-        throw new Error(errData?.detail || "Server error: " + response.status);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response stream available");
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const chunk of lines) {
-          const dataLine = chunk.split("\n").find((l) => l.startsWith("data: "));
-          if (!dataLine) continue;
-
-          try {
-            const data = JSON.parse(dataLine.substring(6));
-            if (data.type === "error") {
-              setError(data.message);
-            } else if (data.type === "result") {
-              setResults((prev) => {
-                const existing = prev.filter((r) => r.name !== data.name);
-                return [...existing, {
-                  name: data.name,
-                  success: data.success,
-                  image_data: data.image_data,
-                  content_type: data.content_type,
-                  error: data.error,
-                }];
-              });
-              setProgress({ completed: data.completed, total: data.total });
-            } else if (data.type === "done") {
-              setProgress({ completed: data.completed, total: data.total });
-            }
-          } catch {
-            // skip
-          }
-        }
-      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed");
     } finally {
@@ -170,29 +114,11 @@ function App() {
     setRetryingAngle(angleName);
     setError(null);
 
-    const formData = new FormData();
-    formData.append("image", imageFile);
-    formData.append("angle_name", angleName);
-    formData.append("lens", lens);
-
     try {
-      const response = await fetch(API_URL + "/api/retry-angle", {
-        method: "POST",
-        body: formData,
-      });
-      if (!response.ok) {
-        const errData = await response.json().catch(() => null);
-        throw new Error(errData?.detail || "Retry failed: " + response.status);
-      }
-      const data = await response.json();
+      const result = await retrySingleAngle(imageFile, angleName, lens);
       setResults((prev) => {
         const existing = prev.filter((r) => r.name !== angleName);
-        return [...existing, {
-          name: data.name,
-          success: data.success,
-          image_data: data.image_data,
-          content_type: data.content_type,
-        }];
+        return [...existing, result];
       });
     } catch (e) {
       setError("Retry for " + angleName + " failed: " + (e instanceof Error ? e.message : "Unknown error"));
