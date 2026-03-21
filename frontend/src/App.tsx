@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   Camera,
   Upload,
@@ -11,8 +11,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+import { generateAllAngles as hfGenerateAllAngles, retrySingleAngle } from "./services/hf-api";
 
 interface AngleResult {
   name: string;
@@ -66,7 +65,21 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [cooldown, setCooldown] = useState(0);
+  const cooldownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Cooldown timer: prevent rapid-fire generation to conserve quota
+  useEffect(() => {
+    if (cooldown <= 0) {
+      if (cooldownRef.current) clearInterval(cooldownRef.current);
+      return;
+    }
+    cooldownRef.current = setInterval(() => {
+      setCooldown((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => { if (cooldownRef.current) clearInterval(cooldownRef.current); };
+  }, [cooldown > 0]);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -101,67 +114,32 @@ function App() {
     setResults([]);
     setProgress({ completed: 0, total: 9 });
 
-    const formData = new FormData();
-    formData.append("image", imageFile);
-    formData.append("lens", lens);
-
     try {
-      const response = await fetch(API_URL + "/api/generate-stream", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errData = await response.json().catch(() => null);
-        throw new Error(errData?.detail || "Server error: " + response.status);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response stream available");
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const chunk of lines) {
-          const dataLine = chunk.split("\n").find((l) => l.startsWith("data: "));
-          if (!dataLine) continue;
-
-          try {
-            const data = JSON.parse(dataLine.substring(6));
-            if (data.type === "error") {
-              setError(data.message);
-            } else if (data.type === "result") {
-              setResults((prev) => {
-                const existing = prev.filter((r) => r.name !== data.name);
-                return [...existing, {
-                  name: data.name,
-                  success: data.success,
-                  image_data: data.image_data,
-                  content_type: data.content_type,
-                  error: data.error,
-                }];
-              });
-              setProgress({ completed: data.completed, total: data.total });
-            } else if (data.type === "done") {
-              setProgress({ completed: data.completed, total: data.total });
-            }
-          } catch {
-            // skip
-          }
+      await hfGenerateAllAngles(imageFile, lens, (update) => {
+        if (update.type === "start") {
+          setProgress({ completed: 0, total: update.total || 9 });
+        } else if (update.type === "result" && update.result) {
+          const r = update.result;
+          setResults((prev) => {
+            const existing = prev.filter((x) => x.name !== r.name);
+            return [...existing, r];
+          });
+          setProgress({ completed: update.completed || 0, total: update.total || 9 });
+        } else if (update.type === "done") {
+          setProgress({ completed: update.completed || 9, total: update.total || 9 });
         }
-      }
+      });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Generation failed");
+      const msg = e instanceof Error ? e.message : "Generation failed";
+      if (msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("429")) {
+        setError("GPU quota exceeded. The app will automatically retry with a different token. Please wait a moment and try again.");
+      } else {
+        setError(msg);
+      }
     } finally {
       setIsGenerating(false);
+      // Start a 30-second cooldown to prevent rapid-fire usage
+      setCooldown(30);
     }
   };
 
@@ -170,29 +148,11 @@ function App() {
     setRetryingAngle(angleName);
     setError(null);
 
-    const formData = new FormData();
-    formData.append("image", imageFile);
-    formData.append("angle_name", angleName);
-    formData.append("lens", lens);
-
     try {
-      const response = await fetch(API_URL + "/api/retry-angle", {
-        method: "POST",
-        body: formData,
-      });
-      if (!response.ok) {
-        const errData = await response.json().catch(() => null);
-        throw new Error(errData?.detail || "Retry failed: " + response.status);
-      }
-      const data = await response.json();
+      const result = await retrySingleAngle(imageFile, angleName, lens);
       setResults((prev) => {
         const existing = prev.filter((r) => r.name !== angleName);
-        return [...existing, {
-          name: data.name,
-          success: data.success,
-          image_data: data.image_data,
-          content_type: data.content_type,
-        }];
+        return [...existing, result];
       });
     } catch (e) {
       setError("Retry for " + angleName + " failed: " + (e instanceof Error ? e.message : "Unknown error"));
@@ -331,13 +291,18 @@ function App() {
 
             <button
               onClick={generateAllAngles}
-              disabled={!imageFile || isGenerating}
+              disabled={!imageFile || isGenerating || cooldown > 0}
               className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
                   {"Generating... (" + progress.completed + "/" + progress.total + ")"}
+                </>
+              ) : cooldown > 0 ? (
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  {"Please wait... (" + cooldown + "s)"}
                 </>
               ) : (
                 <>

@@ -185,41 +185,62 @@ async def generate_stream(
         forward = convert_forward(lens)
         completed = 0
         total = len(PREDEFINED_ANGLES)
+        is_wide = lens == "wide"
 
         yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
 
-        # Create all tasks with angle name tracking
-        pending_tasks = {}
+        # Deduplicate: angles that clamp to the same params share one task
+        # e.g. Right(90), Back Right(135→90), Back(180→90) all map to rotate=90
+        param_to_task: dict[tuple[float, float, float, bool], asyncio.Task] = {}
+        angle_to_task: dict[str, asyncio.Task] = {}
+
         for angle in PREDEFINED_ANGLES:
             rotate = clamp_rotate(float(angle["h"]))
             tilt = convert_vertical(float(angle["v"]))
-            task = asyncio.create_task(
-                hf_client.generate_angle(
-                    uploaded_path=uploaded_path,
-                    image_hash=image_hash,
-                    rotate_deg=rotate,
-                    move_forward=forward,
-                    vertical_tilt=tilt,
-                    wideangle=(lens == "wide"),
-                )
-            )
-            pending_tasks[task] = angle["name"]
+            param_key = (rotate, forward, tilt, is_wide)
 
-        # Yield results as they complete
-        while pending_tasks:
-            done, _ = await asyncio.wait(
-                pending_tasks.keys(),
+            if param_key not in param_to_task:
+                task = asyncio.create_task(
+                    hf_client.generate_angle(
+                        uploaded_path=uploaded_path,
+                        image_hash=image_hash,
+                        rotate_deg=rotate,
+                        move_forward=forward,
+                        vertical_tilt=tilt,
+                        wideangle=is_wide,
+                    )
+                )
+                param_to_task[param_key] = task
+            angle_to_task[angle["name"]] = param_to_task[param_key]
+
+        unique_tasks = set(param_to_task.values())
+        logger.info(
+            "Deduplication: %d angles → %d unique API calls",
+            len(PREDEFINED_ANGLES), len(unique_tasks),
+        )
+
+        # Build reverse mapping: task → list of angle names waiting on it
+        task_to_angles: dict[asyncio.Task, list[str]] = {}
+        for angle_name, task in angle_to_task.items():
+            task_to_angles.setdefault(task, []).append(angle_name)
+
+        # Yield results as unique tasks complete
+        pending = set(unique_tasks)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
-                angle_name = pending_tasks.pop(task)
-                completed += 1
-                try:
-                    img_bytes, content_type = task.result()
-                    b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
+                angle_names = task_to_angles.get(task, [])
+                for angle_name in angle_names:
+                    completed += 1
+                    try:
+                        img_bytes, content_type = task.result()
+                        b64 = base64.b64encode(img_bytes).decode("utf-8")
+                        yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
+                    except Exception as e:
+                        yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done', 'completed': completed, 'total': total})}\n\n"
 

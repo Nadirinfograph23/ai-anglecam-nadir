@@ -13,16 +13,17 @@ HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://linoyts-qwen-image-edit-angles
 # Generation defaults
 DEFAULT_GUIDANCE_SCALE = 1.0
 DEFAULT_INFERENCE_STEPS = 4
-DEFAULT_WIDTH = 1024
-DEFAULT_HEIGHT = 1024
+DEFAULT_WIDTH = 768
+DEFAULT_HEIGHT = 768
 
 # Retry configuration
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
-RETRY_MAX_DELAY = 30.0  # seconds
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 3.0  # seconds
+RETRY_MAX_DELAY = 60.0  # seconds
+QUOTA_RETRY_DELAY = 20.0  # extra delay for quota/rate-limit errors
 
-# Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 3
+# Concurrency control - serialize to minimize quota usage
+MAX_CONCURRENT_GENERATIONS = 1
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results

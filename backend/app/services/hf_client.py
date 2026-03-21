@@ -24,6 +24,7 @@ from app.config import (
     HF_SPACE_URL,
     MAX_CONCURRENT_GENERATIONS,
     MAX_RETRIES,
+    QUOTA_RETRY_DELAY,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
 )
@@ -75,13 +76,14 @@ def compute_image_hash(image_data: bytes) -> str:
 
 
 def clamp_rotate(deg: float) -> float:
-    if -90 <= deg <= 90:
-        return deg
-    if 90 < deg <= 180:
-        return 90.0
-    if -180 <= deg < -90:
-        return -90.0
-    return 0.0
+    """Pass rotation degrees directly without clamping.
+
+    The original implementation capped values to ±90°, which caused
+    Back Right(135°), Back(180°), Back Left(-135°) to produce
+    identical images to Right(90°) and Left(-90°).
+    Now passes the raw value so all 9 angles produce unique images.
+    """
+    return float(deg)
 
 
 def convert_vertical(v: float) -> float:
@@ -118,13 +120,17 @@ class HFClient:
         client = await self._get_client()
         token = HF_API_TOKEN
 
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         for attempt in range(MAX_RETRIES):
             try:
                 files = {"files": (filename, image_data, "image/png")}
                 response = await client.post(
                     f"{HF_SPACE_URL}/gradio_api/upload",
                     files=files,
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=headers,
                 )
                 if response.status_code == 200:
                     result = response.json()
@@ -173,6 +179,17 @@ class HFClient:
                 vertical_tilt, wideangle, seed, randomize_seed
             )
 
+    @staticmethod
+    def _is_quota_error(error: Exception) -> bool:
+        """Check if an error is related to quota/rate limiting."""
+        error_str = str(error).lower()
+        quota_keywords = [
+            "quota", "rate limit", "429", "too many requests",
+            "queue is full", "exceeded", "gpu quota", "limit reached",
+            "no gpu", "queue_full", "busy",
+        ]
+        return any(kw in error_str for kw in quota_keywords)
+
     async def _generate_with_retry(
         self,
         uploaded_path: str,
@@ -184,7 +201,7 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Generate with retry logic."""
+        """Generate with retry logic and quota-aware backoff."""
         last_error: Exception | None = None
 
         for attempt in range(MAX_RETRIES):
@@ -201,13 +218,19 @@ class HFClient:
                 return result
             except Exception as e:
                 last_error = e
+                is_quota = self._is_quota_error(e)
                 logger.warning(
-                    "Generation attempt %d/%d failed for rotate=%.1f: %s",
-                    attempt + 1, MAX_RETRIES, rotate_deg, str(e)
+                    "Generation attempt %d/%d failed for rotate=%.1f%s: %s",
+                    attempt + 1, MAX_RETRIES, rotate_deg,
+                    " (QUOTA)" if is_quota else "", str(e)
                 )
                 if attempt < MAX_RETRIES - 1:
-                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
-                    logger.info("Retrying in %.1f seconds...", delay)
+                    if is_quota:
+                        delay = QUOTA_RETRY_DELAY * (attempt + 1)
+                        logger.info("Quota error — waiting %.1f seconds before retry...", delay)
+                    else:
+                        delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                        logger.info("Retrying in %.1f seconds...", delay)
                     await asyncio.sleep(delay)
 
         raise RuntimeError(
@@ -228,6 +251,10 @@ class HFClient:
         client = await self._get_client()
         token = HF_API_TOKEN
 
+        headers_with_auth: dict[str, str] = {}
+        if token:
+            headers_with_auth["Authorization"] = f"Bearer {token}"
+
         # Step 1: Submit the job
         payload = {
             "data": [
@@ -247,18 +274,22 @@ class HFClient:
             ]
         }
 
+        submit_headers = {"Content-Type": "application/json", **headers_with_auth}
         submit_response = await client.post(
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer",
             json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers=submit_headers,
         )
 
+        if submit_response.status_code == 429:
+            raise RuntimeError("Rate limit / quota exceeded (429). Please wait and try again.")
+
         if submit_response.status_code != 200:
+            body = submit_response.text[:300]
+            if "queue" in body.lower() or "quota" in body.lower():
+                raise RuntimeError(f"Quota/queue error: {body}")
             raise RuntimeError(
-                f"Submit failed: {submit_response.status_code} - {submit_response.text[:300]}"
+                f"Submit failed: {submit_response.status_code} - {body}"
             )
 
         event_id = submit_response.json().get("event_id")
@@ -268,8 +299,11 @@ class HFClient:
         # Step 2: Poll for result (SSE stream)
         result_response = await client.get(
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers_with_auth,
         )
+
+        if result_response.status_code == 429:
+            raise RuntimeError("Rate limit / quota exceeded while fetching result (429).")
 
         if result_response.status_code != 200:
             raise RuntimeError(
@@ -282,7 +316,7 @@ class HFClient:
         # Step 3: Download the generated image
         image_response = await client.get(
             image_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers_with_auth,
         )
 
         if image_response.status_code != 200:
@@ -297,14 +331,31 @@ class HFClient:
         """Parse SSE response to extract image URL."""
         lines = text.split("\n")
         error_msg = ""
+        is_error_event = False
 
         for line in lines:
             if line.startswith("event: error"):
+                is_error_event = True
                 error_msg = "API returned an error"
+                continue
             if line.startswith("data: "):
                 data_str = line[6:].strip()
                 if data_str == "null":
                     continue
+                # If this data follows an error event, extract the error message
+                if is_error_event:
+                    try:
+                        err_data = json.loads(data_str)
+                        if isinstance(err_data, str):
+                            error_msg = err_data
+                        elif isinstance(err_data, dict):
+                            error_msg = err_data.get("message", str(err_data))
+                    except (json.JSONDecodeError, TypeError):
+                        error_msg = data_str
+                    # Check for quota-specific errors
+                    if any(kw in error_msg.lower() for kw in ["quota", "limit", "queue", "gpu", "busy"]):
+                        raise RuntimeError(f"Quota/rate limit error: {error_msg}")
+                    raise RuntimeError(error_msg)
                 try:
                     data = json.loads(data_str)
                     if isinstance(data, list) and len(data) > 0:
@@ -313,6 +364,8 @@ class HFClient:
                             return first["url"]
                 except (json.JSONDecodeError, TypeError, KeyError):
                     continue
+            else:
+                is_error_event = False
 
         raise RuntimeError(error_msg or "No result image found in SSE response")
 
