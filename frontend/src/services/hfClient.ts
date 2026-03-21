@@ -1,24 +1,11 @@
 /**
- * Multi-provider image generation client with automatic fallback.
- *
- * Provider priority:
- * 1. HuggingFace (primary — specialized camera angle model)
- * 2. Replicate (SDXL img2img, needs VITE_REPLICATE_API_TOKEN)
- * 3. Flux Schnell (public HF Space, fast generation)
- * 4. DeepAI (text2img, needs VITE_DEEPAI_API_KEY)
- * 5. Craiyon (public, lower quality, last resort)
- *
- * Each provider is retried 1-2 times with timeout handling.
- * Results are cached to avoid redundant API calls.
+ * Image generation client using HuggingFace Qwen Image Edit.
+ * Includes retry logic and caching for reliability.
  */
 
 import { generateWithFallback } from "./fallbackController";
-import type { FallbackStatus } from "./fallbackController";
 import type { AngleParams } from "./providers/types";
 import { imageCache } from "./imageCache";
-
-export type { FallbackStatus } from "./fallbackController";
-export { getAvailableProviders } from "./fallbackController";
 
 export interface AngleConfig {
   name: string;
@@ -104,14 +91,12 @@ export interface AngleResult {
   image_data?: string;
   content_type?: string;
   error?: string;
-  provider?: string;
 }
 
 export type OnProgress = (
   result: AngleResult,
   completed: number,
   total: number,
-  fallbackStatus?: FallbackStatus,
 ) => void;
 
 export async function generateAllAngles(
@@ -152,15 +137,6 @@ export async function generateAllAngles(
           params,
           imageHash,
           lens,
-          (status) => {
-            // Report fallback status to UI during generation
-            onProgress?.(
-              { name: angle.name, success: false },
-              completed,
-              total,
-              status,
-            );
-          },
         );
 
         const angleResult: AngleResult = {
@@ -168,7 +144,6 @@ export async function generateAllAngles(
           success: true,
           image_data: result.imageData,
           content_type: result.contentType,
-          provider: result.provider,
         };
 
         completed++;
@@ -227,7 +202,6 @@ export async function retrySingleAngle(
       success: true,
       image_data: result.imageData,
       content_type: result.contentType,
-      provider: result.provider,
     };
   } catch (e) {
     return {
