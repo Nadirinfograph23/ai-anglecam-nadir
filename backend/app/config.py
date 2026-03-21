@@ -17,12 +17,22 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 # Retry configuration
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
-RETRY_MAX_DELAY = 30.0  # seconds
+MAX_RETRIES = 4
+RETRY_BASE_DELAY = 3.0  # seconds
+RETRY_MAX_DELAY = 60.0  # seconds
+
+# Quota-specific retry settings
+QUOTA_RETRY_BASE_DELAY = 10.0  # longer initial delay for quota errors
+QUOTA_RETRY_MAX_DELAY = 120.0  # longer max delay for quota errors
 
 # Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 3
+MAX_CONCURRENT_GENERATIONS = 2
+
+# Delay between sequential API calls to avoid bursting
+INTER_REQUEST_DELAY = 1.5  # seconds between API calls
+
+# Global rate limiting (requests per minute)
+GLOBAL_RATE_LIMIT_RPM = 20
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results

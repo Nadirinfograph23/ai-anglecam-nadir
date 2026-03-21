@@ -14,6 +14,7 @@ from app.config import (
     PREDEFINED_ANGLES,
 )
 from app.services.hf_client import (
+    QuotaExceededError,
     clamp_rotate,
     compute_image_hash,
     convert_forward,
@@ -111,6 +112,12 @@ async def generate_single(
             "image_data": b64,
             "content_type": content_type,
         })
+    except QuotaExceededError as e:
+        logger.warning("Single generation quota exceeded: %s", str(e))
+        raise HTTPException(
+            status_code=429,
+            detail="API quota exceeded. Please wait a few minutes and try again.",
+        )
     except Exception as e:
         logger.error("Single generation failed: %s", str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -146,6 +153,12 @@ async def generate_all(
             total=len(results),
             successful=successful,
             failed=failed,
+        )
+    except QuotaExceededError as e:
+        logger.warning("All-angles generation quota exceeded: %s", str(e))
+        raise HTTPException(
+            status_code=429,
+            detail="API quota exceeded. Please wait a few minutes and try again.",
         )
     except Exception as e:
         logger.error("All-angles generation failed: %s", str(e))
@@ -279,6 +292,12 @@ async def retry_angle(
             "image_data": b64,
             "content_type": content_type,
         })
+    except QuotaExceededError as e:
+        logger.warning("Retry for %s quota exceeded: %s", angle_name, str(e))
+        raise HTTPException(
+            status_code=429,
+            detail="API quota exceeded. Please wait a few minutes and try again.",
+        )
     except Exception as e:
         logger.error("Retry for %s failed: %s", angle_name, str(e))
         raise HTTPException(status_code=500, detail=str(e))
