@@ -195,7 +195,9 @@ class HFClient:
     async def upload_image(self, image_data: bytes, filename: str = "input.png") -> str:
         """Upload image to HF Space and return the file path."""
         client = await self._get_client()
-        token = HF_API_TOKEN
+        headers: dict[str, str] = {}
+        if HF_API_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -206,7 +208,7 @@ class HFClient:
                 response = await client.post(
                     f"{HF_SPACE_URL}/gradio_api/upload",
                     files=files,
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=headers,
                 )
                 if response.status_code == 200:
                     result = response.json()
@@ -346,7 +348,9 @@ class HFClient:
     ) -> tuple[bytes, str]:
         """Make the actual Gradio API call with rate limiting."""
         client = await self._get_client()
-        token = HF_API_TOKEN
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if HF_API_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
 
         # Apply rate limiting and throttling
         await self._rate_limiter.acquire()
@@ -374,10 +378,7 @@ class HFClient:
         submit_response = await client.post(
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer",
             json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers=headers,
         )
 
         if submit_response.status_code != 200:
@@ -397,9 +398,12 @@ class HFClient:
             raise RuntimeError("No event_id in submit response")
 
         # Step 2: Poll for result (SSE stream)
+        poll_headers: dict[str, str] = {}
+        if HF_API_TOKEN:
+            poll_headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
         result_response = await client.get(
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=poll_headers,
         )
 
         if result_response.status_code != 200:
@@ -417,9 +421,12 @@ class HFClient:
         image_url = self._parse_sse_response(result_response.text)
 
         # Step 3: Download the generated image
+        dl_headers: dict[str, str] = {}
+        if HF_API_TOKEN:
+            dl_headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
         image_response = await client.get(
             image_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=dl_headers,
         )
 
         if image_response.status_code != 200:
