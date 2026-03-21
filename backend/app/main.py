@@ -2,11 +2,14 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.config import (
@@ -282,3 +285,9 @@ async def retry_angle(
     except Exception as e:
         logger.error("Retry for %s failed: %s", angle_name, str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Serve frontend static files (must be after all API routes)
+_static_dir = Path(__file__).resolve().parent.parent / "static"
+if _static_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="frontend")
