@@ -14,6 +14,7 @@ from app.config import (
     PREDEFINED_ANGLES,
 )
 from app.services.hf_client import (
+    QuotaExceededError,
     clamp_rotate,
     compute_image_hash,
     convert_forward,
