@@ -71,6 +71,12 @@ async def get_angles():
     return {"angles": PREDEFINED_ANGLES}
 
 
+@app.get("/api/status")
+async def get_status():
+    """Return current system status including cache, queue, and token info."""
+    return hf_client.get_status()
+
+
 @app.post("/api/generate-single")
 async def generate_single(
     image: UploadFile = File(...),

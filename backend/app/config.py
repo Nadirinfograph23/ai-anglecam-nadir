@@ -10,6 +10,12 @@ load_dotenv(_env_path)
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://linoyts-qwen-image-edit-angles.hf.space")
 
+# Multi-token fallback: comma-separated list of HF tokens
+# Falls back to next token when current one is rate-limited or fails
+HF_API_TOKENS: list[str] = [
+    t.strip() for t in os.getenv("HF_API_TOKENS", HF_API_TOKEN).split(",") if t.strip()
+]
+
 # Generation defaults
 DEFAULT_GUIDANCE_SCALE = 1.0
 DEFAULT_INFERENCE_STEPS = 4
@@ -24,6 +30,9 @@ RETRY_MAX_DELAY = 30.0  # seconds
 # Concurrency control - how many parallel generations at once
 MAX_CONCURRENT_GENERATIONS = 3
 
+# Queue settings
+MAX_QUEUE_SIZE = 10  # max pending jobs in queue
+
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results
 CACHE_TTL_SECONDS = 3600  # 1 hour
@@ -31,6 +40,11 @@ CACHE_TTL_SECONDS = 3600  # 1 hour
 # Upload settings
 MAX_UPLOAD_SIZE_MB = 20
 UPLOAD_DIR = "/tmp/anglecam_uploads"
+
+# GitHub RAW image storage
+GITHUB_RAW_REPO = os.getenv("GITHUB_RAW_REPO", "")  # e.g., "owner/repo"
+GITHUB_RAW_TOKEN = os.getenv("GITHUB_RAW_TOKEN", "")
+GITHUB_RAW_BRANCH = os.getenv("GITHUB_RAW_BRANCH", "generated-images")
 
 # The 9 predefined camera angles
 PREDEFINED_ANGLES = [
