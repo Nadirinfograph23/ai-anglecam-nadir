@@ -31,20 +31,20 @@ interface PendingAngle {
 type GridItem = AngleResult | PendingAngle;
 
 const ANGLE_NAMES = [
-  "Front", "Front Right", "Right", "Back Right", "Back",
-  "Back Left", "Left", "Front Left", "Top View",
+  "Front", "Front Right", "Right", "Front Left", "Left",
+  "Top Front", "Top Right", "Top Left", "Low Front",
 ];
 
 const ANGLE_LABELS: Record<string, string> = {
   Front: "Front View",
   "Front Right": "Front Right",
   Right: "Right Side",
-  "Back Right": "Back Right",
-  Back: "Back View",
-  "Back Left": "Back Left",
-  Left: "Left Side",
   "Front Left": "Front Left",
-  "Top View": "Top View",
+  Left: "Left Side",
+  "Top Front": "Top Front",
+  "Top Right": "Top Right",
+  "Top Left": "Top Left",
+  "Low Front": "Low Front",
 };
 
 const LENS_OPTIONS = [
@@ -66,7 +66,20 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [cooldownUntil, setCooldownUntil] = useState<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const isOnCooldown = Date.now() < cooldownUntil;
+
+  const startCooldown = (seconds: number) => {
+    setCooldownUntil(Date.now() + seconds * 1000);
+    setTimeout(() => setCooldownUntil(0), seconds * 1000);
+  };
+
+  const isQuotaError = (msg: string) => {
+    const lower = msg.toLowerCase();
+    return lower.includes("quota") || lower.includes("rate limit") || lower.includes("429") || lower.includes("too many");
+  };
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -159,7 +172,13 @@ function App() {
         }
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Generation failed");
+      const msg = e instanceof Error ? e.message : "Generation failed";
+      if (isQuotaError(msg)) {
+        setError("API quota exceeded. Please wait 2-3 minutes before trying again.");
+        startCooldown(120);
+      } else {
+        setError(msg);
+      }
     } finally {
       setIsGenerating(false);
     }
@@ -195,7 +214,13 @@ function App() {
         }];
       });
     } catch (e) {
-      setError("Retry for " + angleName + " failed: " + (e instanceof Error ? e.message : "Unknown error"));
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      if (isQuotaError(msg)) {
+        setError("API quota exceeded. Please wait 2-3 minutes before retrying.");
+        startCooldown(120);
+      } else {
+        setError("Retry for " + angleName + " failed: " + msg);
+      }
     } finally {
       setRetryingAngle(null);
     }
@@ -331,7 +356,7 @@ function App() {
 
             <button
               onClick={generateAllAngles}
-              disabled={!imageFile || isGenerating}
+              disabled={!imageFile || isGenerating || isOnCooldown}
               className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
@@ -342,7 +367,7 @@ function App() {
               ) : (
                 <>
                   <Sparkles className="h-5 w-5" />
-                  Generate All 9 Angles
+                  {isOnCooldown ? "Cooling Down..." : "Generate All 9 Angles"}
                 </>
               )}
             </button>

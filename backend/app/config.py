@@ -21,8 +21,17 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0  # seconds
 RETRY_MAX_DELAY = 30.0  # seconds
 
+# Quota-specific retry configuration
+QUOTA_RETRY_BASE_DELAY = 10.0  # seconds - longer wait for quota errors
+QUOTA_RETRY_MAX_DELAY = 120.0  # seconds
+
+# Rate limiting - control request frequency to HF Space
+INTER_REQUEST_DELAY = 1.5  # seconds between requests
+RATE_LIMIT_TOKENS = 2  # max concurrent tokens
+RATE_LIMIT_REFILL_RATE = 0.5  # tokens per second
+
 # Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 3
+MAX_CONCURRENT_GENERATIONS = 2
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results
@@ -33,14 +42,17 @@ MAX_UPLOAD_SIZE_MB = 20
 UPLOAD_DIR = "/tmp/anglecam_uploads"
 
 # The 9 predefined camera angles
+# NOTE: The HF Space model supports rotation from -90 to 90 degrees
+# and vertical tilt from -1 to 1 (mapped from -60 to 60 degrees).
+# All angles must stay within these ranges to avoid clamping/duplicates.
 PREDEFINED_ANGLES = [
     {"name": "Front", "h": 0, "v": 0},
     {"name": "Front Right", "h": 45, "v": 0},
     {"name": "Right", "h": 90, "v": 0},
-    {"name": "Back Right", "h": 135, "v": 0},
-    {"name": "Back", "h": 180, "v": 0},
-    {"name": "Back Left", "h": -135, "v": 0},
-    {"name": "Left", "h": -90, "v": 0},
     {"name": "Front Left", "h": -45, "v": 0},
-    {"name": "Top View", "h": 0, "v": 60},
+    {"name": "Left", "h": -90, "v": 0},
+    {"name": "Top Front", "h": 0, "v": 60},
+    {"name": "Top Right", "h": 45, "v": 30},
+    {"name": "Top Left", "h": -45, "v": 30},
+    {"name": "Low Front", "h": 0, "v": -30},
 ]
