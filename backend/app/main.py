@@ -193,12 +193,14 @@ async def generate_stream(
         for angle in PREDEFINED_ANGLES:
             rotate = clamp_rotate(float(angle["h"]))
             tilt = convert_vertical(float(angle["v"]))
+            # Use per-angle forward override if defined, otherwise use lens default
+            angle_forward = angle.get("forward") if angle.get("forward") is not None else forward
             task = asyncio.create_task(
                 hf_client.generate_angle(
                     uploaded_path=uploaded_path,
                     image_hash=image_hash,
                     rotate_deg=rotate,
-                    move_forward=forward,
+                    move_forward=angle_forward,
                     vertical_tilt=tilt,
                     wideangle=(lens == "wide"),
                 )
@@ -262,12 +264,14 @@ async def retry_angle(
         forward = convert_forward(lens)
         rotate = clamp_rotate(float(angle_config["h"]))
         tilt = convert_vertical(float(angle_config["v"]))
+        # Use per-angle forward override if defined
+        angle_forward = angle_config.get("forward") if angle_config.get("forward") is not None else forward
 
         img_bytes, content_type = await hf_client.generate_angle(
             uploaded_path=uploaded_path,
             image_hash=image_hash,
             rotate_deg=rotate,
-            move_forward=forward,
+            move_forward=angle_forward,
             vertical_tilt=tilt,
             wideangle=(lens == "wide"),
         )
