@@ -8,6 +8,13 @@ _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path)
 
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
+# Support multiple HF API tokens for quota rotation
+# Set HF_API_TOKENS as comma-separated list, or fall back to single HF_API_TOKEN
+_tokens_str = os.getenv("HF_API_TOKENS", "")
+HF_API_TOKENS: list[str] = [
+    t.strip() for t in _tokens_str.split(",") if t.strip()
+] if _tokens_str else ([HF_API_TOKEN] if HF_API_TOKEN else [])
+
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://linoyts-qwen-image-edit-angles.hf.space")
 
 # Generation defaults
@@ -16,13 +23,14 @@ DEFAULT_INFERENCE_STEPS = 4
 DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
-# Retry configuration
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
-RETRY_MAX_DELAY = 30.0  # seconds
+# Retry configuration - scale retries with number of tokens
+MAX_RETRIES = max(4, len(HF_API_TOKENS) * 2)
+RETRY_BASE_DELAY = 1.0  # seconds
+RETRY_MAX_DELAY = 15.0  # seconds
 
 # Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 3
+# Scale concurrency with number of available API keys
+MAX_CONCURRENT_GENERATIONS = max(3, len(HF_API_TOKENS) * 2)
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results
