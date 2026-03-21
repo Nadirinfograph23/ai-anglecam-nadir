@@ -21,6 +21,7 @@ from app.config import (
     DEFAULT_INFERENCE_STEPS,
     DEFAULT_WIDTH,
     HF_API_TOKEN,
+    HF_API_TOKENS,
     HF_SPACE_URL,
     MAX_CONCURRENT_GENERATIONS,
     MAX_RETRIES,
@@ -93,6 +94,49 @@ def convert_forward(lens: str) -> float:
     return mapping.get(lens, 2.0)
 
 
+class TokenRotator:
+    """Round-robin token rotator with per-token rate limit tracking."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self._tokens = tokens if tokens else [""]
+        self._index = 0
+        self._lock = asyncio.Lock()
+        self._failed_tokens: dict[str, float] = {}  # token -> cooldown_until timestamp
+        self._cooldown_seconds = 60.0
+
+    @property
+    def count(self) -> int:
+        return len(self._tokens)
+
+    async def get_token(self) -> str:
+        """Get the next available token using round-robin rotation."""
+        async with self._lock:
+            now = time.time()
+            # Try each token, starting from current index
+            for _ in range(len(self._tokens)):
+                token = self._tokens[self._index]
+                self._index = (self._index + 1) % len(self._tokens)
+                cooldown_until = self._failed_tokens.get(token, 0)
+                if now >= cooldown_until:
+                    return token
+            # All tokens are on cooldown; return the one with earliest cooldown
+            earliest_token = min(self._failed_tokens, key=self._failed_tokens.get)  # type: ignore[arg-type]
+            return earliest_token
+
+    async def mark_rate_limited(self, token: str) -> None:
+        """Mark a token as rate-limited so it's temporarily skipped."""
+        async with self._lock:
+            self._failed_tokens[token] = time.time() + self._cooldown_seconds
+            logger.warning("Token ...%s marked rate-limited for %.0fs",
+                           token[-4:] if len(token) > 4 else "****",
+                           self._cooldown_seconds)
+
+    async def mark_success(self, token: str) -> None:
+        """Clear rate-limit status for a token after a successful request."""
+        async with self._lock:
+            self._failed_tokens.pop(token, None)
+
+
 class HFClient:
     """Client for interacting with the HuggingFace Gradio Space API."""
 
@@ -100,6 +144,9 @@ class HFClient:
         self._cache = ImageCache()
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
         self._http_client: httpx.AsyncClient | None = None
+        self._token_rotator = TokenRotator(HF_API_TOKENS)
+        logger.info("HFClient initialized with %d API token(s), concurrency=%d",
+                    self._token_rotator.count, MAX_CONCURRENT_GENERATIONS)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
@@ -116,9 +163,9 @@ class HFClient:
     async def upload_image(self, image_data: bytes, filename: str = "input.png") -> str:
         """Upload image to HF Space and return the file path."""
         client = await self._get_client()
-        token = HF_API_TOKEN
 
         for attempt in range(MAX_RETRIES):
+            token = await self._token_rotator.get_token()
             try:
                 files = {"files": (filename, image_data, "image/png")}
                 response = await client.post(
@@ -129,13 +176,18 @@ class HFClient:
                 if response.status_code == 200:
                     result = response.json()
                     if isinstance(result, list) and len(result) > 0:
+                        await self._token_rotator.mark_success(token)
                         return result[0]
                     raise ValueError(f"Unexpected upload response: {result}")
 
-                logger.warning(
-                    "Upload attempt %d failed: %d %s",
-                    attempt + 1, response.status_code, response.text[:200]
-                )
+                if response.status_code == 429:
+                    await self._token_rotator.mark_rate_limited(token)
+                    logger.warning("Upload rate-limited on attempt %d, rotating token", attempt + 1)
+                else:
+                    logger.warning(
+                        "Upload attempt %d failed: %d %s",
+                        attempt + 1, response.status_code, response.text[:200]
+                    )
             except httpx.TimeoutException:
                 logger.warning("Upload attempt %d timed out", attempt + 1)
             except Exception as e:
@@ -224,9 +276,9 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Make the actual Gradio API call."""
+        """Make the actual Gradio API call with token rotation."""
         client = await self._get_client()
-        token = HF_API_TOKEN
+        token = await self._token_rotator.get_token()
 
         # Step 1: Submit the job
         payload = {
@@ -256,6 +308,10 @@ class HFClient:
             },
         )
 
+        if submit_response.status_code == 429:
+            await self._token_rotator.mark_rate_limited(token)
+            raise RuntimeError("Rate limited - token rotated for retry")
+
         if submit_response.status_code != 200:
             raise RuntimeError(
                 f"Submit failed: {submit_response.status_code} - {submit_response.text[:300]}"
@@ -270,6 +326,10 @@ class HFClient:
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
+
+        if result_response.status_code == 429:
+            await self._token_rotator.mark_rate_limited(token)
+            raise RuntimeError("Rate limited during result fetch")
 
         if result_response.status_code != 200:
             raise RuntimeError(
@@ -290,6 +350,7 @@ class HFClient:
                 f"Image download failed: {image_response.status_code}"
             )
 
+        await self._token_rotator.mark_success(token)
         content_type = image_response.headers.get("content-type", "image/webp")
         return image_response.content, content_type
 

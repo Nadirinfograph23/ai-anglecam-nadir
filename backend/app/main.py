@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.config import (
+    MAX_CONCURRENT_GENERATIONS,
     MAX_UPLOAD_SIZE_MB,
     PREDEFINED_ANGLES,
 )
@@ -62,7 +63,11 @@ class GenerateAllResponse(BaseModel):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "tokens_available": hf_client._token_rotator.count,
+        "max_concurrency": MAX_CONCURRENT_GENERATIONS,
+    }
 
 
 @app.get("/api/angles")
