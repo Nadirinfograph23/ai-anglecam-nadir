@@ -75,13 +75,16 @@ def compute_image_hash(image_data: bytes) -> str:
 
 
 def clamp_rotate(deg: float) -> float:
-    if -90 <= deg <= 90:
-        return deg
-    if 90 < deg <= 180:
-        return 90.0
-    if -180 <= deg < -90:
-        return -90.0
-    return 0.0
+    """Normalize rotation to [-180, 180] range.
+
+    The Qwen Image Edit model accepts rotation degrees via text prompt
+    and can handle the full [-180, 180] range for back-angle generation.
+    """
+    # Normalize to [-180, 180]
+    deg = deg % 360
+    if deg > 180:
+        deg -= 360
+    return float(deg)
 
 
 def convert_vertical(v: float) -> float:
@@ -224,7 +227,7 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Make the actual Gradio API call."""
+        """Make the actual Gradio API call with streaming SSE support."""
         client = await self._get_client()
         token = HF_API_TOKEN
 
@@ -265,19 +268,8 @@ class HFClient:
         if not event_id:
             raise RuntimeError("No event_id in submit response")
 
-        # Step 2: Poll for result (SSE stream)
-        result_response = await client.get(
-            f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-
-        if result_response.status_code != 200:
-            raise RuntimeError(
-                f"Result fetch failed: {result_response.status_code}"
-            )
-
-        # Parse SSE response
-        image_url = self._parse_sse_response(result_response.text)
+        # Step 2: Stream SSE response with timeout
+        image_url = await self._stream_sse_result(client, event_id, token)
 
         # Step 3: Download the generated image
         image_response = await client.get(
@@ -292,6 +284,43 @@ class HFClient:
 
         content_type = image_response.headers.get("content-type", "image/webp")
         return image_response.content, content_type
+
+    async def _stream_sse_result(
+        self,
+        client: httpx.AsyncClient,
+        event_id: str,
+        token: str,
+        timeout: float = 180.0,
+    ) -> str:
+        """Stream SSE response from Gradio API with proper timeout handling."""
+        sse_text = ""
+        try:
+            async with asyncio.timeout(timeout):
+                async with client.stream(
+                    "GET",
+                    f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"Result fetch failed: {response.status_code}"
+                        )
+                    async for chunk in response.aiter_text():
+                        sse_text += chunk
+                        # Try to parse as soon as we have data
+                        try:
+                            image_url = self._parse_sse_response(sse_text)
+                            return image_url
+                        except RuntimeError:
+                            # Not ready yet, keep reading
+                            continue
+        except TimeoutError:
+            raise RuntimeError(
+                f"SSE result timed out after {timeout}s for event {event_id}"
+            )
+
+        # Final attempt to parse whatever we collected
+        return self._parse_sse_response(sse_text)
 
     def _parse_sse_response(self, text: str) -> str:
         """Parse SSE response to extract image URL."""

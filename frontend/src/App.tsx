@@ -10,6 +10,7 @@ import {
   ImageIcon,
   Sparkles,
   X,
+  StopCircle,
 } from "lucide-react";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -67,6 +68,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -94,8 +96,26 @@ function App() {
     [handleFileSelect]
   );
 
+  const cancelGeneration = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsGenerating(false);
+    setError("Generation cancelled");
+  }, []);
+
   const generateAllAngles = async () => {
     if (!imageFile) return;
+
+    // Cancel any existing generation
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setIsGenerating(true);
     setError(null);
     setResults([]);
@@ -105,10 +125,19 @@ function App() {
     formData.append("image", imageFile);
     formData.append("lens", lens);
 
+    // Set a global timeout for the entire generation (5 minutes)
+    const globalTimeout = setTimeout(() => {
+      if (controller.signal.aborted) return;
+      controller.abort();
+      setIsGenerating(false);
+      setError("Generation timed out after 5 minutes. Some angles may have completed - you can retry the failed ones.");
+    }, 5 * 60 * 1000);
+
     try {
       const response = await fetch(API_URL + "/api/generate-stream", {
         method: "POST",
         body: formData,
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -122,10 +151,25 @@ function App() {
       const decoder = new TextDecoder();
       let buffer = "";
 
+      // Per-chunk stall timeout: if no data arrives for 120s, abort
+      let stallTimer: ReturnType<typeof setTimeout> | null = null;
+      const resetStallTimer = () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+          if (!controller.signal.aborted) {
+            controller.abort();
+            setIsGenerating(false);
+            setError("Connection stalled - no data received for 2 minutes. You can retry failed angles individually.");
+          }
+        }, 120_000);
+      };
+      resetStallTimer();
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
+        resetStallTimer();
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n\n");
         buffer = lines.pop() || "";
@@ -158,9 +202,17 @@ function App() {
           }
         }
       }
+
+      if (stallTimer) clearTimeout(stallTimer);
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        // Already handled by cancel or timeout
+        return;
+      }
       setError(e instanceof Error ? e.message : "Generation failed");
     } finally {
+      clearTimeout(globalTimeout);
+      abortControllerRef.current = null;
       setIsGenerating(false);
     }
   };
@@ -329,23 +381,33 @@ function App() {
               </div>
             </div>
 
-            <button
-              onClick={generateAllAngles}
-              disabled={!imageFile || isGenerating}
-              className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {isGenerating ? (
-                <>
+            {isGenerating ? (
+              <div className="flex gap-2">
+                <button
+                  disabled
+                  className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white opacity-70 cursor-not-allowed"
+                >
                   <Loader2 className="h-5 w-5 animate-spin" />
                   {"Generating... (" + progress.completed + "/" + progress.total + ")"}
-                </>
-              ) : (
-                <>
-                  <Sparkles className="h-5 w-5" />
-                  Generate All 9 Angles
-                </>
-              )}
-            </button>
+                </button>
+                <button
+                  onClick={cancelGeneration}
+                  className="flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 px-4 py-3.5 text-base font-semibold text-white transition-colors"
+                  title="Cancel generation"
+                >
+                  <StopCircle className="h-5 w-5" />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={generateAllAngles}
+                disabled={!imageFile}
+                className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Sparkles className="h-5 w-5" />
+                Generate All 9 Angles
+              </button>
+            )}
 
             {isGenerating && (
               <div className="rounded-xl bg-gray-800 p-3">
