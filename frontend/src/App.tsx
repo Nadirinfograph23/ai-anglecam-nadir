@@ -14,9 +14,10 @@ import {
 import {
   generateAllAngles as hfGenerateAllAngles,
   retrySingleAngle,
+  getAvailableProviders,
   PREDEFINED_ANGLES,
 } from "./services/hfClient";
-import type { AngleResult } from "./services/hfClient";
+import type { AngleResult, FallbackStatus } from "./services/hfClient";
 
 interface PendingAngle {
   name: string;
@@ -59,7 +60,9 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [fallbackStatus, setFallbackStatus] = useState<FallbackStatus | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const availableProviders = getAvailableProviders();
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -95,17 +98,23 @@ function App() {
     setProgress({ completed: 0, total: 9 });
 
     try {
-      await hfGenerateAllAngles(imageFile, lens, (result, completed, total) => {
-        setResults((prev) => {
-          const existing = prev.filter((r) => r.name !== result.name);
-          return [...existing, result];
-        });
-        setProgress({ completed, total });
+      await hfGenerateAllAngles(imageFile, lens, (result, completed, total, status) => {
+        if (status) {
+          setFallbackStatus(status);
+        }
+        if (result.success || result.error) {
+          setResults((prev) => {
+            const existing = prev.filter((r) => r.name !== result.name);
+            return [...existing, result];
+          });
+          setProgress({ completed, total });
+        }
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed");
     } finally {
       setIsGenerating(false);
+      setFallbackStatus(null);
     }
   };
 
@@ -179,7 +188,7 @@ function App() {
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Sparkles className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Powered by Qwen Image Edit</span>
+              <span className="hidden sm:inline">{"Multi-Provider (" + availableProviders.length + " active)"}</span>
             </div>
           </div>
         </div>
@@ -284,6 +293,11 @@ function App() {
                 <p className="text-center text-gray-400 text-xs mt-2">
                   {progress.completed + "/" + progress.total + " angles completed"}
                 </p>
+                {fallbackStatus && (
+                  <p className="text-center text-xs mt-1 text-cyan-400">
+                    {"Using " + fallbackStatus.currentProvider + " (attempt " + fallbackStatus.attempt + ")"}
+                  </p>
+                )}
               </div>
             )}
 
@@ -383,6 +397,11 @@ function App() {
                         <p className="text-white text-xs font-medium text-center">
                           {ANGLE_LABELS[item.name] || item.name}
                         </p>
+                        {item.success && "provider" in item && item.provider && (
+                          <p className="text-gray-400 text-[10px] text-center -mt-0.5">
+                            {"via " + item.provider}
+                          </p>
+                        )}
                       </div>
                     </div>
                   ))}

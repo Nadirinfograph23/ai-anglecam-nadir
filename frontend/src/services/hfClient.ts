@@ -1,16 +1,24 @@
 /**
- * HuggingFace Gradio Space client for direct browser-to-HF API calls.
- * Eliminates the need for a separate backend server.
+ * Multi-provider image generation client with automatic fallback.
+ *
+ * Provider priority:
+ * 1. HuggingFace (primary — specialized camera angle model)
+ * 2. Replicate (SDXL img2img, needs VITE_REPLICATE_API_TOKEN)
+ * 3. Flux Schnell (public HF Space, fast generation)
+ * 4. DeepAI (text2img, needs VITE_DEEPAI_API_KEY)
+ * 5. Craiyon (public, lower quality, last resort)
+ *
+ * Each provider is retried 1-2 times with timeout handling.
+ * Results are cached to avoid redundant API calls.
  */
 
-const HF_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
+import { generateWithFallback } from "./fallbackController";
+import type { FallbackStatus } from "./fallbackController";
+import type { AngleParams } from "./providers/types";
+import { imageCache } from "./imageCache";
 
-const DEFAULT_GUIDANCE_SCALE = 1.0;
-const DEFAULT_INFERENCE_STEPS = 4;
-const DEFAULT_WIDTH = 1024;
-const DEFAULT_HEIGHT = 1024;
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY = 2000; // ms
+export type { FallbackStatus } from "./fallbackController";
+export { getAvailableProviders } from "./fallbackController";
 
 export interface AngleConfig {
   name: string;
@@ -46,188 +54,7 @@ export function convertForward(lens: string): number {
   return mapping[lens] ?? 2.0;
 }
 
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function uploadImage(imageData: Blob): Promise<string> {
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      const formData = new FormData();
-      formData.append("files", imageData, "input.png");
-
-      const response = await fetch(`${HF_SPACE_URL}/gradio_api/upload`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        if (Array.isArray(result) && result.length > 0) {
-          return result[0];
-        }
-        throw new Error(`Unexpected upload response: ${JSON.stringify(result)}`);
-      }
-
-      console.warn(`Upload attempt ${attempt + 1} failed: ${response.status}`);
-    } catch (e) {
-      if (e instanceof TypeError && e.message.includes("fetch")) {
-        console.warn(`Upload attempt ${attempt + 1} network error`);
-      } else if (attempt === MAX_RETRIES - 1) {
-        throw e;
-      }
-    }
-
-    if (attempt < MAX_RETRIES - 1) {
-      const delay = Math.min(RETRY_BASE_DELAY * Math.pow(2, attempt), 30000);
-      await sleep(delay);
-    }
-  }
-
-  throw new Error("Failed to upload image after all retries");
-}
-
-function parseSSEResponse(text: string): string {
-  const lines = text.split("\n");
-  let errorMsg = "";
-
-  for (const line of lines) {
-    if (line.startsWith("event: error")) {
-      errorMsg = "API returned an error";
-    }
-    if (line.startsWith("data: ")) {
-      const dataStr = line.substring(6).trim();
-      if (dataStr === "null") continue;
-      try {
-        const data = JSON.parse(dataStr);
-        if (Array.isArray(data) && data.length > 0) {
-          const first = data[0];
-          if (typeof first === "object" && first !== null && "url" in first) {
-            return first.url;
-          }
-        }
-      } catch {
-        continue;
-      }
-    }
-  }
-
-  throw new Error(errorMsg || "No result image found in SSE response");
-}
-
-async function generateAngle(
-  uploadedPath: string,
-  rotateDeg: number,
-  moveForward: number,
-  verticalTilt: number,
-  wideangle: boolean,
-  seed: number = 0,
-  randomizeSeed: boolean = true,
-): Promise<{ imageData: string; contentType: string }> {
-  const payload = {
-    data: [
-      false, // is_reset_val
-      { path: uploadedPath, meta: { _type: "gradio.FileData" } },
-      rotateDeg,
-      moveForward,
-      verticalTilt,
-      wideangle,
-      seed,
-      randomizeSeed,
-      DEFAULT_GUIDANCE_SCALE,
-      DEFAULT_INFERENCE_STEPS,
-      DEFAULT_WIDTH,
-      DEFAULT_HEIGHT,
-      null, // prev_output
-    ],
-  };
-
-  // Step 1: Submit the job
-  const submitResponse = await fetch(`${HF_SPACE_URL}/gradio_api/call/maybe_infer`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!submitResponse.ok) {
-    const text = await submitResponse.text();
-    throw new Error(`Submit failed: ${submitResponse.status} - ${text.substring(0, 300)}`);
-  }
-
-  const submitResult = await submitResponse.json();
-  const eventId = submitResult.event_id;
-  if (!eventId) {
-    throw new Error("No event_id in submit response");
-  }
-
-  // Step 2: Poll for result (SSE stream)
-  const resultResponse = await fetch(
-    `${HF_SPACE_URL}/gradio_api/call/maybe_infer/${eventId}`,
-  );
-
-  if (!resultResponse.ok) {
-    throw new Error(`Result fetch failed: ${resultResponse.status}`);
-  }
-
-  const resultText = await resultResponse.text();
-  const imageUrl = parseSSEResponse(resultText);
-
-  // Step 3: Download the generated image
-  const imageResponse = await fetch(imageUrl);
-
-  if (!imageResponse.ok) {
-    throw new Error(`Image download failed: ${imageResponse.status}`);
-  }
-
-  const contentType = imageResponse.headers.get("content-type") || "image/webp";
-  const imageBlob = await imageResponse.blob();
-
-  // Convert to base64
-  const base64 = await blobToBase64(imageBlob);
-
-  return { imageData: base64, contentType };
-}
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const result = reader.result as string;
-      // Remove the data:...;base64, prefix
-      const base64 = result.split(",")[1];
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function generateAngleWithRetry(
-  uploadedPath: string,
-  rotateDeg: number,
-  moveForward: number,
-  verticalTilt: number,
-  wideangle: boolean,
-): Promise<{ imageData: string; contentType: string }> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      return await generateAngle(uploadedPath, rotateDeg, moveForward, verticalTilt, wideangle);
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn(`Generation attempt ${attempt + 1}/${MAX_RETRIES} failed: ${lastError.message}`);
-      if (attempt < MAX_RETRIES - 1) {
-        const delay = Math.min(RETRY_BASE_DELAY * Math.pow(2, attempt), 30000);
-        await sleep(delay);
-      }
-    }
-  }
-
-  throw new Error(`Generation failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
-}
-
-async function optimizeImage(file: File): Promise<Blob> {
+export function optimizeImage(file: File): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -277,9 +104,15 @@ export interface AngleResult {
   image_data?: string;
   content_type?: string;
   error?: string;
+  provider?: string;
 }
 
-export type OnProgress = (result: AngleResult, completed: number, total: number) => void;
+export type OnProgress = (
+  result: AngleResult,
+  completed: number,
+  total: number,
+  fallbackStatus?: FallbackStatus,
+) => void;
 
 export async function generateAllAngles(
   file: File,
@@ -287,8 +120,7 @@ export async function generateAllAngles(
   onProgress?: OnProgress,
 ): Promise<AngleResult[]> {
   const optimized = await optimizeImage(file);
-  const uploadedPath = await uploadImage(optimized);
-
+  const imageHash = await imageCache.computeImageHash(file);
   const forward = convertForward(lens);
   const total = PREDEFINED_ANGLES.length;
   const results: AngleResult[] = [];
@@ -306,13 +138,29 @@ export async function generateAllAngles(
       const rotate = clampRotate(angle.h);
       const tilt = convertVertical(angle.v);
 
+      const params: AngleParams = {
+        rotateDeg: rotate,
+        moveForward: forward,
+        verticalTilt: tilt,
+        wideangle: lens === "wide",
+        angleName: angle.name,
+      };
+
       try {
-        const result = await generateAngleWithRetry(
-          uploadedPath,
-          rotate,
-          forward,
-          tilt,
-          lens === "wide",
+        const result = await generateWithFallback(
+          optimized,
+          params,
+          imageHash,
+          lens,
+          (status) => {
+            // Report fallback status to UI during generation
+            onProgress?.(
+              { name: angle.name, success: false },
+              completed,
+              total,
+              status,
+            );
+          },
         );
 
         const angleResult: AngleResult = {
@@ -320,6 +168,7 @@ export async function generateAllAngles(
           success: true,
           image_data: result.imageData,
           content_type: result.contentType,
+          provider: result.provider,
         };
 
         completed++;
@@ -358,24 +207,27 @@ export async function retrySingleAngle(
 
   try {
     const optimized = await optimizeImage(file);
-    const uploadedPath = await uploadImage(optimized);
+    const imageHash = await imageCache.computeImageHash(file);
     const forward = convertForward(lens);
     const rotate = clampRotate(angleConfig.h);
     const tilt = convertVertical(angleConfig.v);
 
-    const result = await generateAngleWithRetry(
-      uploadedPath,
-      rotate,
-      forward,
-      tilt,
-      lens === "wide",
-    );
+    const params: AngleParams = {
+      rotateDeg: rotate,
+      moveForward: forward,
+      verticalTilt: tilt,
+      wideangle: lens === "wide",
+      angleName,
+    };
+
+    const result = await generateWithFallback(optimized, params, imageHash, lens);
 
     return {
       name: angleName,
       success: true,
       image_data: result.imageData,
       content_type: result.contentType,
+      provider: result.provider,
     };
   } catch (e) {
     return {
