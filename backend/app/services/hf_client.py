@@ -116,10 +116,16 @@ class HFClient:
         if self._http_client and not self._http_client.is_closed:
             await self._http_client.aclose()
 
+    @staticmethod
+    def _auth_headers() -> dict[str, str]:
+        """Return Authorization header only when a token is configured."""
+        if HF_API_TOKEN:
+            return {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        return {}
+
     async def upload_image(self, image_data: bytes, filename: str = "input.png") -> str:
         """Upload image to HF Space and return the file path."""
         client = await self._get_client()
-        token = HF_API_TOKEN
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -127,7 +133,7 @@ class HFClient:
                 response = await client.post(
                     f"{HF_SPACE_URL}/gradio_api/upload",
                     files=files,
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=self._auth_headers(),
                 )
                 if response.status_code == 200:
                     result = response.json()
@@ -229,7 +235,6 @@ class HFClient:
     ) -> tuple[bytes, str]:
         """Make the actual Gradio API call with streaming SSE support."""
         client = await self._get_client()
-        token = HF_API_TOKEN
 
         # Step 1: Submit the job
         payload = {
@@ -253,10 +258,7 @@ class HFClient:
         submit_response = await client.post(
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer",
             json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Content-Type": "application/json", **self._auth_headers()},
         )
 
         if submit_response.status_code != 200:
@@ -269,12 +271,12 @@ class HFClient:
             raise RuntimeError("No event_id in submit response")
 
         # Step 2: Stream SSE response with timeout
-        image_url = await self._stream_sse_result(client, event_id, token)
+        image_url = await self._stream_sse_result(client, event_id)
 
         # Step 3: Download the generated image
         image_response = await client.get(
             image_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=self._auth_headers(),
         )
 
         if image_response.status_code != 200:
@@ -289,7 +291,6 @@ class HFClient:
         self,
         client: httpx.AsyncClient,
         event_id: str,
-        token: str,
         timeout: float = 180.0,
     ) -> str:
         """Stream SSE response from Gradio API with proper timeout handling."""
@@ -299,7 +300,7 @@ class HFClient:
                 async with client.stream(
                     "GET",
                     f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=self._auth_headers(),
                 ) as response:
                     if response.status_code != 200:
                         raise RuntimeError(
