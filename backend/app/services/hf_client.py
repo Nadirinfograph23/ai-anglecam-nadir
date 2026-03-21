@@ -16,14 +16,11 @@ from PIL import Image
 from app.config import (
     CACHE_MAX_SIZE,
     CACHE_TTL_SECONDS,
-    DEFAULT_GUIDANCE_SCALE,
-    DEFAULT_HEIGHT,
-    DEFAULT_INFERENCE_STEPS,
-    DEFAULT_WIDTH,
     HF_API_TOKEN,
     HF_SPACE_URL,
     MAX_CONCURRENT_GENERATIONS,
     MAX_RETRIES,
+    PREDEFINED_ANGLES,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
 )
@@ -104,8 +101,9 @@ class HFClient:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(300.0, connect=30.0),
+                timeout=httpx.Timeout(600.0, connect=60.0),
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                follow_redirects=True,
             )
         return self._http_client
 
@@ -113,10 +111,15 @@ class HFClient:
         if self._http_client and not self._http_client.is_closed:
             await self._http_client.aclose()
 
+    def _auth_headers(self) -> dict[str, str]:
+        """Return auth headers if HF_API_TOKEN is set."""
+        if HF_API_TOKEN:
+            return {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        return {}
+
     async def upload_image(self, image_data: bytes, filename: str = "input.png") -> str:
         """Upload image to HF Space and return the file path."""
         client = await self._get_client()
-        token = HF_API_TOKEN
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -124,11 +127,12 @@ class HFClient:
                 response = await client.post(
                     f"{HF_SPACE_URL}/gradio_api/upload",
                     files=files,
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=self._auth_headers(),
                 )
                 if response.status_code == 200:
                     result = response.json()
                     if isinstance(result, list) and len(result) > 0:
+                        logger.info("Image uploaded successfully: %s", result[0])
                         return result[0]
                     raise ValueError(f"Unexpected upload response: {result}")
 
@@ -224,9 +228,9 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Make the actual Gradio API call."""
+        """Make the actual Gradio API call with proper SSE streaming."""
         client = await self._get_client()
-        token = HF_API_TOKEN
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
 
         # Step 1: Submit the job
         payload = {
@@ -239,50 +243,50 @@ class HFClient:
                 wideangle,
                 seed,
                 randomize_seed,
-                DEFAULT_GUIDANCE_SCALE,
-                DEFAULT_INFERENCE_STEPS,
-                DEFAULT_WIDTH,
-                DEFAULT_HEIGHT,
+                1.0,   # guidance_scale
+                4,     # num_inference_steps
+                None,  # height (auto)
+                None,  # width (auto)
                 None,  # prev_output
             ]
         }
 
+        logger.info(
+            "Submitting job: rotate=%.1f fwd=%.1f tilt=%.1f wide=%s",
+            rotate_deg, move_forward, vertical_tilt, wideangle
+        )
+
         submit_response = await client.post(
             f"{HF_SPACE_URL}/gradio_api/call/maybe_infer",
             json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers=headers,
         )
 
         if submit_response.status_code != 200:
             raise RuntimeError(
-                f"Submit failed: {submit_response.status_code} - {submit_response.text[:300]}"
+                f"Submit failed: {submit_response.status_code} - {submit_response.text[:500]}"
             )
 
         event_id = submit_response.json().get("event_id")
         if not event_id:
-            raise RuntimeError("No event_id in submit response")
-
-        # Step 2: Poll for result (SSE stream)
-        result_response = await client.get(
-            f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-
-        if result_response.status_code != 200:
             raise RuntimeError(
-                f"Result fetch failed: {result_response.status_code}"
+                f"No event_id in submit response: {submit_response.text[:300]}"
             )
 
-        # Parse SSE response
-        image_url = self._parse_sse_response(result_response.text)
+        logger.info("Job submitted, event_id=%s", event_id)
+
+        # Step 2: Stream the SSE response for the result
+        result_url = f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}"
+        image_url = await self._stream_sse_result(client, result_url)
 
         # Step 3: Download the generated image
+        if not image_url.startswith("http"):
+            image_url = f"{HF_SPACE_URL}/gradio_api/file={image_url}"
+
+        logger.info("Downloading result image from: %s", image_url[:120])
         image_response = await client.get(
             image_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=self._auth_headers(),
         )
 
         if image_response.status_code != 200:
@@ -291,30 +295,89 @@ class HFClient:
             )
 
         content_type = image_response.headers.get("content-type", "image/webp")
+        logger.info(
+            "Image downloaded successfully, content_type=%s, size=%d bytes",
+            content_type, len(image_response.content)
+        )
         return image_response.content, content_type
 
-    def _parse_sse_response(self, text: str) -> str:
-        """Parse SSE response to extract image URL."""
-        lines = text.split("\n")
-        error_msg = ""
+    async def _stream_sse_result(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> str:
+        """Stream SSE response and extract the result image URL."""
+        image_url: str | None = None
+        current_event = ""
 
-        for line in lines:
-            if line.startswith("event: error"):
-                error_msg = "API returned an error"
-            if line.startswith("data: "):
-                data_str = line[6:].strip()
-                if data_str == "null":
+        async with client.stream("GET", url, headers=self._auth_headers()) as response:
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"SSE stream failed: {response.status_code}"
+                )
+
+            async for raw_line in response.aiter_lines():
+                line = raw_line.strip()
+
+                if not line:
+                    current_event = ""
                     continue
-                try:
-                    data = json.loads(data_str)
+
+                if line.startswith("event:"):
+                    current_event = line[6:].strip()
+                    if current_event == "error":
+                        logger.warning("Received error event from SSE stream")
+                    elif current_event == "heartbeat":
+                        logger.debug("Heartbeat received")
+                    continue
+
+                if line.startswith("data:"):
+                    data_str = line[5:].strip()
+
+                    if current_event == "error":
+                        raise RuntimeError(f"API error: {data_str}")
+
+                    if data_str == "null" or not data_str:
+                        continue
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if current_event == "complete":
+                        image_url = self._extract_image_url(data)
+                        if image_url:
+                            return image_url
+
+                    # Also handle data without explicit complete event
                     if isinstance(data, list) and len(data) > 0:
-                        first = data[0]
-                        if isinstance(first, dict) and "url" in first:
-                            return first["url"]
-                except (json.JSONDecodeError, TypeError, KeyError):
-                    continue
+                        url_candidate = self._extract_image_url(data)
+                        if url_candidate:
+                            image_url = url_candidate
 
-        raise RuntimeError(error_msg or "No result image found in SSE response")
+        if image_url:
+            return image_url
+
+        raise RuntimeError("No result image found in SSE stream")
+
+    def _extract_image_url(self, data: list | dict) -> str | None:
+        """Extract image URL from Gradio response data."""
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if isinstance(item, dict):
+                if "url" in item:
+                    return item["url"]
+                if "path" in item:
+                    return item["path"]
+            if isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, dict):
+                        if "url" in sub:
+                            return sub["url"]
+                        if "path" in sub:
+                            return sub["path"]
+        return None
 
     async def generate_all_angles(
         self,
@@ -323,19 +386,11 @@ class HFClient:
         on_progress: asyncio.Queue | None = None,
     ) -> list[dict]:
         """Generate all 9 angle images with controlled parallelism."""
-        from app.config import PREDEFINED_ANGLES
-
         image_hash = compute_image_hash(image_data)
-
-        # Optimize image for upload
         optimized = self.optimize_image(image_data)
-
-        # Upload once, reuse for all angles
         uploaded_path = await self.upload_image(optimized)
-
         forward = convert_forward(lens)
 
-        # Create tasks for all angles
         results: list[dict] = []
         tasks = []
 

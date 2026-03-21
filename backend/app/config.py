@@ -17,12 +17,13 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 # Retry configuration
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
-RETRY_MAX_DELAY = 30.0  # seconds
+MAX_RETRIES = 4
+RETRY_BASE_DELAY = 3.0  # seconds
+RETRY_MAX_DELAY = 45.0  # seconds
 
 # Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 3
+# ZeroGPU spaces can only process limited concurrent requests
+MAX_CONCURRENT_GENERATIONS = 2
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results
