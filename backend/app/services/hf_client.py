@@ -1,4 +1,4 @@
-"""HuggingFace Gradio Space client with retries, caching, and concurrency control."""
+"""HuggingFace Gradio Space client with retries, caching, rate limiting, and concurrency control."""
 
 import asyncio
 import base64
@@ -20,15 +20,27 @@ from app.config import (
     DEFAULT_HEIGHT,
     DEFAULT_INFERENCE_STEPS,
     DEFAULT_WIDTH,
+    GLOBAL_RATE_LIMIT_RPM,
     HF_API_TOKEN,
     HF_SPACE_URL,
+    INTER_REQUEST_DELAY,
     MAX_CONCURRENT_GENERATIONS,
     MAX_RETRIES,
+    QUOTA_RETRY_BASE_DELAY,
+    QUOTA_RETRY_MAX_DELAY,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class QuotaExceededError(Exception):
+    """Raised when the HF API quota is exceeded."""
+
+    def __init__(self, message: str = "API quota exceeded", retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -70,6 +82,32 @@ class ImageCache:
             self._cache.popitem(last=False)
 
 
+class TokenBucketRateLimiter:
+    """Simple token bucket rate limiter for controlling API request rate."""
+
+    def __init__(self, rpm: int = GLOBAL_RATE_LIMIT_RPM):
+        self._tokens = float(rpm)
+        self._max_tokens = float(rpm)
+        self._refill_rate = rpm / 60.0  # tokens per second
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(self._max_tokens, self._tokens + elapsed * self._refill_rate)
+            self._last_refill = now
+
+            if self._tokens < 1.0:
+                wait_time = (1.0 - self._tokens) / self._refill_rate
+                logger.info("Rate limiter: waiting %.1f seconds", wait_time)
+                await asyncio.sleep(wait_time)
+                self._tokens = 0.0
+            else:
+                self._tokens -= 1.0
+
+
 def compute_image_hash(image_data: bytes) -> str:
     return hashlib.sha256(image_data).hexdigest()[:16]
 
@@ -93,6 +131,26 @@ def convert_forward(lens: str) -> float:
     return mapping.get(lens, 2.0)
 
 
+def _is_quota_error(status_code: int, response_text: str) -> bool:
+    """Detect if an API error is quota/rate-limit related."""
+    if status_code in (429, 503):
+        return True
+    quota_keywords = ["quota", "rate limit", "too many requests", "exceeded", "throttl"]
+    lower_text = response_text.lower()
+    return any(kw in lower_text for kw in quota_keywords)
+
+
+def _parse_retry_after(response_headers: httpx.Headers) -> float | None:
+    """Parse Retry-After header if present."""
+    retry_after = response_headers.get("retry-after")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return None
+
+
 class HFClient:
     """Client for interacting with the HuggingFace Gradio Space API."""
 
@@ -100,14 +158,27 @@ class HFClient:
         self._cache = ImageCache()
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
         self._http_client: httpx.AsyncClient | None = None
+        self._rate_limiter = TokenBucketRateLimiter()
+        self._last_request_time: float = 0.0
+        self._request_lock = asyncio.Lock()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(300.0, connect=30.0),
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
             )
         return self._http_client
+
+    async def _throttle(self) -> None:
+        """Ensure minimum delay between API requests to avoid bursting."""
+        async with self._request_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < INTER_REQUEST_DELAY:
+                wait_time = INTER_REQUEST_DELAY - elapsed
+                await asyncio.sleep(wait_time)
+            self._last_request_time = time.monotonic()
 
     async def close(self) -> None:
         if self._http_client and not self._http_client.is_closed:
@@ -120,6 +191,9 @@ class HFClient:
 
         for attempt in range(MAX_RETRIES):
             try:
+                await self._rate_limiter.acquire()
+                await self._throttle()
+
                 files = {"files": (filename, image_data, "image/png")}
                 response = await client.post(
                     f"{HF_SPACE_URL}/gradio_api/upload",
@@ -132,18 +206,41 @@ class HFClient:
                         return result[0]
                     raise ValueError(f"Unexpected upload response: {result}")
 
+                if _is_quota_error(response.status_code, response.text):
+                    retry_after = _parse_retry_after(response.headers)
+                    raise QuotaExceededError(
+                        f"Upload quota exceeded (HTTP {response.status_code})",
+                        retry_after=retry_after,
+                    )
+
                 logger.warning(
                     "Upload attempt %d failed: %d %s",
                     attempt + 1, response.status_code, response.text[:200]
                 )
+            except QuotaExceededError as e:
+                delay = e.retry_after or min(
+                    QUOTA_RETRY_BASE_DELAY * (2 ** attempt), QUOTA_RETRY_MAX_DELAY
+                )
+                logger.warning(
+                    "Upload quota exceeded on attempt %d, waiting %.1fs: %s",
+                    attempt + 1, delay, str(e)
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
             except httpx.TimeoutException:
                 logger.warning("Upload attempt %d timed out", attempt + 1)
+                if attempt < MAX_RETRIES - 1:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                    await asyncio.sleep(delay)
             except Exception as e:
+                if isinstance(e, QuotaExceededError):
+                    raise
                 logger.warning("Upload attempt %d error: %s", attempt + 1, str(e))
-
-            if attempt < MAX_RETRIES - 1:
-                delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
-                await asyncio.sleep(delay)
+                if attempt < MAX_RETRIES - 1:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                    await asyncio.sleep(delay)
 
         raise RuntimeError("Failed to upload image after all retries")
 
@@ -184,7 +281,7 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Generate with retry logic."""
+        """Generate with retry logic and quota-aware backoff."""
         last_error: Exception | None = None
 
         for attempt in range(MAX_RETRIES):
@@ -199,6 +296,17 @@ class HFClient:
                     result[0], result[1]
                 )
                 return result
+            except QuotaExceededError as e:
+                last_error = e
+                delay = e.retry_after or min(
+                    QUOTA_RETRY_BASE_DELAY * (2 ** attempt), QUOTA_RETRY_MAX_DELAY
+                )
+                logger.warning(
+                    "Quota exceeded on attempt %d/%d for rotate=%.1f, waiting %.1fs: %s",
+                    attempt + 1, MAX_RETRIES, rotate_deg, delay, str(e)
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
             except Exception as e:
                 last_error = e
                 logger.warning(
@@ -210,6 +318,10 @@ class HFClient:
                     logger.info("Retrying in %.1f seconds...", delay)
                     await asyncio.sleep(delay)
 
+        if isinstance(last_error, QuotaExceededError):
+            raise QuotaExceededError(
+                "API quota exceeded after all retries. Please wait a few minutes and try again."
+            )
         raise RuntimeError(
             f"Generation failed after {MAX_RETRIES} attempts: {last_error}"
         )
@@ -224,9 +336,13 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Make the actual Gradio API call."""
+        """Make the actual Gradio API call with rate limiting."""
         client = await self._get_client()
         token = HF_API_TOKEN
+
+        # Apply rate limiting and throttling
+        await self._rate_limiter.acquire()
+        await self._throttle()
 
         # Step 1: Submit the job
         payload = {
@@ -257,6 +373,13 @@ class HFClient:
         )
 
         if submit_response.status_code != 200:
+            if _is_quota_error(submit_response.status_code, submit_response.text):
+                retry_after = _parse_retry_after(submit_response.headers)
+                raise QuotaExceededError(
+                    f"API quota exceeded (HTTP {submit_response.status_code}): "
+                    f"{submit_response.text[:200]}",
+                    retry_after=retry_after,
+                )
             raise RuntimeError(
                 f"Submit failed: {submit_response.status_code} - {submit_response.text[:300]}"
             )
@@ -272,6 +395,12 @@ class HFClient:
         )
 
         if result_response.status_code != 200:
+            if _is_quota_error(result_response.status_code, result_response.text):
+                retry_after = _parse_retry_after(result_response.headers)
+                raise QuotaExceededError(
+                    f"API quota exceeded while fetching result (HTTP {result_response.status_code})",
+                    retry_after=retry_after,
+                )
             raise RuntimeError(
                 f"Result fetch failed: {result_response.status_code}"
             )
@@ -307,13 +436,22 @@ class HFClient:
                     continue
                 try:
                     data = json.loads(data_str)
+                    # Check for quota error in data
+                    if isinstance(data, dict) and "error" in data:
+                        error_text = str(data["error"])
+                        if _is_quota_error(429, error_text):
+                            raise QuotaExceededError(f"API quota error: {error_text}")
                     if isinstance(data, list) and len(data) > 0:
                         first = data[0]
                         if isinstance(first, dict) and "url" in first:
                             return first["url"]
+                except QuotaExceededError:
+                    raise
                 except (json.JSONDecodeError, TypeError, KeyError):
                     continue
 
+        if "queue" in error_msg.lower() or "quota" in error_msg.lower():
+            raise QuotaExceededError(error_msg)
         raise RuntimeError(error_msg or "No result image found in SSE response")
 
     async def generate_all_angles(
@@ -322,7 +460,7 @@ class HFClient:
         lens: str = "normal",
         on_progress: asyncio.Queue | None = None,
     ) -> list[dict]:
-        """Generate all 9 angle images with controlled parallelism."""
+        """Generate all 9 angle images with controlled parallelism and rate limiting."""
         from app.config import PREDEFINED_ANGLES
 
         image_hash = compute_image_hash(image_data)
@@ -360,7 +498,13 @@ class HFClient:
 
         for i, result in enumerate(task_results):
             angle = PREDEFINED_ANGLES[i]
-            if isinstance(result, Exception):
+            if isinstance(result, QuotaExceededError):
+                results.append({
+                    "name": angle["name"],
+                    "success": False,
+                    "error": "API quota exceeded. Please wait a few minutes and try again.",
+                })
+            elif isinstance(result, Exception):
                 results.append({
                     "name": angle["name"],
                     "success": False,
