@@ -2,9 +2,6 @@
   "buildCommand": "cd frontend && npm install && npm run build",
   "outputDirectory": "frontend/dist",
   "framework": null,
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" }
-  ],
   "headers": [
     {
       "source": "/api/(.*)",
@@ -17,7 +14,7 @@
   ],
   "functions": {
     "api/**/*.ts": {
-      "maxDuration": 300
+      "maxDuration": 60
     }
   }
 }
