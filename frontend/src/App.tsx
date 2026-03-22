@@ -160,9 +160,11 @@ function App() {
 
     // Fall back to backend API
     setApiSource("Backend API");
-    await generateWithBackend();
-    incrementUsage();
-    setRemaining(getRemainingToday());
+    const backendSuccess = await generateWithBackend();
+    if (backendSuccess) {
+      incrementUsage();
+      setRemaining(getRemainingToday());
+    }
     setIsGenerating(false);
   };
 
@@ -207,8 +209,9 @@ function App() {
     return anySuccess;
   };
 
-  const generateWithBackend = async () => {
-    if (!imageFile) return;
+  const generateWithBackend = async (): Promise<boolean> => {
+    if (!imageFile) return false;
+    let anySuccess = false;
 
     const formData = new FormData();
     formData.append("image", imageFile);
@@ -250,6 +253,7 @@ function App() {
             if (data.type === "error") {
               setError(data.message);
             } else if (data.type === "result") {
+              if (data.success) anySuccess = true;
               setResults((prev) => {
                 const existing = prev.filter((r) => r.name !== data.name);
                 return [
@@ -275,6 +279,7 @@ function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed");
     }
+    return anySuccess;
   };
 
   const retryAngle = async (angleName: string) => {
