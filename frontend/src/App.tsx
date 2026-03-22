@@ -12,7 +12,22 @@ import {
   X,
   Zap,
   Shield,
+  Globe,
 } from "lucide-react";
+
+// Puter.js global type declaration (loaded via CDN in index.html)
+declare const puter: {
+  ai: {
+    txt2img: (
+      prompt: string,
+      options?: {
+        model?: string;
+        input_image?: string;
+        test_mode?: boolean;
+      },
+    ) => Promise<HTMLImageElement>;
+  };
+};
 
 // Error Boundary for graceful error handling
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: Error | null }> {
@@ -49,7 +64,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
 }
 
 // ===== Generation Source Configuration =====
-type GenerationSource = "auto" | "anglechanger" | "huggingface";
+type GenerationSource = "auto" | "anglechanger" | "puter" | "huggingface";
 
 // ===== AngleChanger.ai API Configuration =====
 const AC_API_BASE = "/acapi";
@@ -266,6 +281,72 @@ async function generateSingleAngleFromAC(
 
   // Step 3: Fetch the result image and convert to base64
   return await fetchACImageAsBase64(resultUrl);
+}
+
+// ===== Puter.js API Client =====
+function buildAnglePrompt(angle: { name: string; h: number; v: number }): string {
+  const directionMap: Record<string, string> = {
+    "Front": "from directly in front, facing the subject head-on",
+    "Front Right": "from the front-right at approximately 45 degrees",
+    "Right": "from the right side at 90 degrees",
+    "Back Right": "from the back-right at approximately 135 degrees",
+    "Back": "from directly behind the subject at 180 degrees",
+    "Back Left": "from the back-left at approximately 225 degrees",
+    "Left": "from the left side at 270 degrees",
+    "Front Left": "from the front-left at approximately 315 degrees",
+    "Top View": "from above, looking down at approximately 60 degrees elevation",
+  };
+  const direction = directionMap[angle.name] || "from a " + angle.h + " degree horizontal angle";
+  return "Render this same object or scene viewed " + direction +
+    ". Maintain the same subject, lighting, colors, and style. " +
+    "Change only the camera viewing angle. Keep the background consistent.";
+}
+
+function imageElementToBase64(imgEl: HTMLImageElement): Promise<{ imageData: string; contentType: string }> {
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = imgEl.naturalWidth || imgEl.width || 1024;
+    canvas.height = imgEl.naturalHeight || imgEl.height || 1024;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) { reject(new Error("Canvas context unavailable")); return; }
+    ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) { reject(new Error("Canvas toBlob failed")); return; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = reader.result as string;
+          resolve({
+            imageData: result.split(",")[1] || "",
+            contentType: blob.type || "image/png",
+          });
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      },
+      "image/png"
+    );
+  });
+}
+
+async function generateSingleAngleFromPuter(
+  imageBase64: string,
+  angle: { name: string; h: number; v: number },
+): Promise<{ imageData: string; contentType: string }> {
+  if (typeof puter === "undefined") {
+    throw new Error("Puter.js SDK not loaded");
+  }
+
+  const prompt = buildAnglePrompt(angle);
+  // Remove data URI prefix if present, puter expects raw base64
+  const rawBase64 = imageBase64.includes(",") ? imageBase64.split(",")[1] : imageBase64;
+
+  const imgElement = await puter.ai.txt2img(prompt, {
+    model: "gemini-2.5-flash-preview-image-generation",
+    input_image: rawBase64,
+  });
+
+  return await imageElementToBase64(imgElement);
 }
 
 // ===== Image Optimization =====
@@ -500,6 +581,7 @@ function isPending(item: GridItem): item is PendingAngle {
 const SOURCE_OPTIONS: { value: GenerationSource; label: string; icon: typeof Zap }[] = [
   { value: "auto", label: "Auto", icon: Zap },
   { value: "anglechanger", label: "AngleChanger", icon: Shield },
+  { value: "puter", label: "Puter.js", icon: Globe },
   { value: "huggingface", label: "HuggingFace", icon: Sparkles },
 ];
 
@@ -558,8 +640,10 @@ function App() {
     hfPath: string | null,
     forward: number,
     isWide: boolean,
+    imageBase64?: string | null,
   ): Promise<{ imageData: string; contentType: string }> => {
     const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+    const usePuter = chosenSource === "puter" || chosenSource === "auto";
     const useHF = chosenSource === "huggingface" || chosenSource === "auto";
 
     // Try AngleChanger first (if selected or auto)
@@ -573,11 +657,33 @@ function App() {
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : "";
         console.warn("[AC] Failed for " + angle.name + ":", errMsg);
-        // If it's a limit error and we're in auto mode, switch to HF
+        if (chosenSource === "auto" && usePuter && imageBase64) {
+          console.log("[AUTO] Falling back to Puter.js for " + angle.name);
+          setActiveSource("Puter.js (fallback)");
+        } else if (chosenSource === "auto" && useHF && hfPath) {
+          console.log("[AUTO] Falling back to HuggingFace for " + angle.name);
+          setActiveSource("HuggingFace (fallback)");
+        } else if (chosenSource === "anglechanger") {
+          throw e; // No fallback available
+        }
+      }
+    }
+
+    // Try Puter.js (if selected or as fallback)
+    if (usePuter && imageBase64) {
+      try {
+        const result = await withRetry(
+          () => generateSingleAngleFromPuter(imageBase64, angle),
+          2, 3000, "[Puter] " + angle.name
+        );
+        return result;
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : "";
+        console.warn("[Puter] Failed for " + angle.name + ":", errMsg);
         if (chosenSource === "auto" && useHF && hfPath) {
           console.log("[AUTO] Falling back to HuggingFace for " + angle.name);
           setActiveSource("HuggingFace (fallback)");
-        } else if (!useHF) {
+        } else if (chosenSource === "puter") {
           throw e; // No fallback available
         }
       }
@@ -606,12 +712,28 @@ function App() {
 
     const chosenSource = source;
     const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+    const usePuter = chosenSource === "puter" || chosenSource === "auto";
     const useHF = chosenSource === "huggingface" || chosenSource === "auto";
 
     try {
       // Upload to sources in parallel
       let acUrl: string | null = null;
       let hfPath: string | null = null;
+      let imgBase64: string | null = null;
+
+      // Prepare base64 for Puter.js (no upload needed, just read image)
+      if (usePuter) {
+        try {
+          imgBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(imageFile);
+          });
+        } catch (e) {
+          console.warn("[Puter] Image read failed:", e instanceof Error ? e.message : e);
+        }
+      }
 
       if (useAC) {
         setActiveSource("AngleChanger.ai");
@@ -626,12 +748,19 @@ function App() {
           if (chosenSource === "anglechanger") {
             throw new Error("AngleChanger.ai upload failed: " + (e instanceof Error ? e.message : "Unknown error"));
           }
-          // In auto mode, will fallback to HF
+          // In auto mode, will fallback to Puter.js or HF
+        }
+      }
+
+      if (chosenSource === "puter") {
+        setActiveSource("Puter.js");
+        if (!imgBase64) {
+          throw new Error("Failed to read image for Puter.js generation.");
         }
       }
 
       if (useHF && (!acUrl || chosenSource === "auto")) {
-        if (!acUrl) setActiveSource("HuggingFace");
+        if (!acUrl && !imgBase64) setActiveSource("HuggingFace");
         try {
           const optimized = await optimizeImage(imageFile);
           hfPath = await withRetry(
@@ -641,14 +770,14 @@ function App() {
           uploadedPathRef.current = hfPath;
         } catch (e) {
           console.warn("[HF] Upload failed:", e instanceof Error ? e.message : e);
-          if (!acUrl) {
+          if (!acUrl && !imgBase64) {
             throw new Error("All upload sources failed. Please try again.");
           }
-          // AC upload succeeded, continue with AC only
+          // Other sources available, continue
         }
       }
 
-      if (!acUrl && !hfPath) {
+      if (!acUrl && !imgBase64 && !hfPath) {
         throw new Error("Failed to upload image to any generation source.");
       }
 
@@ -657,13 +786,13 @@ function App() {
       let completedCount = 0;
       const anglesToGenerate = PREDEFINED_ANGLES.slice(0, total);
 
-      // Generate angles sequentially for AC (to avoid rate limits), batched for HF
-      if (acUrl && (chosenSource === "anglechanger" || chosenSource === "auto")) {
-        // Sequential for AngleChanger.ai to respect rate limits
+      // Generate angles sequentially for AC/Puter (to avoid rate limits), batched for HF-only
+      if ((acUrl && (chosenSource === "anglechanger" || chosenSource === "auto")) || chosenSource === "puter") {
+        // Sequential to respect rate limits
         for (const angle of anglesToGenerate) {
           try {
             const result = await generateAngleWithFallback(
-              angle, chosenSource, acUrl, hfPath, forward, isWide
+              angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
             );
             completedCount++;
             setProgress({ completed: completedCount, total });
@@ -698,7 +827,7 @@ function App() {
           const batchPromises = batch.map(async (angle) => {
             try {
               const result = await generateAngleWithFallback(
-                angle, chosenSource, acUrl, hfPath, forward, isWide
+                angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
               );
               completedCount++;
               setProgress({ completed: completedCount, total });
@@ -755,16 +884,29 @@ function App() {
       // Try to use existing uploads, or re-upload
       let acUrl = acUploadedUrlRef.current;
       let hfPath = uploadedPathRef.current;
+      let imgBase64: string | null = null;
 
       const chosenSource = source;
       const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+      const usePuter = chosenSource === "puter" || chosenSource === "auto";
       const useHF = chosenSource === "huggingface" || chosenSource === "auto";
 
       if (useAC && !acUrl) {
         try {
           acUrl = await withRetry(() => uploadToAngleChanger(imageFile), 2, 2000, "AC Upload");
           acUploadedUrlRef.current = acUrl;
-        } catch { /* will fallback to HF */ }
+        } catch { /* will fallback */ }
+      }
+
+      if (usePuter) {
+        try {
+          imgBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(imageFile);
+          });
+        } catch { /* will fallback */ }
       }
 
       if (useHF && !hfPath) {
@@ -776,7 +918,7 @@ function App() {
       }
 
       const result = await generateAngleWithFallback(
-        angle, chosenSource, acUrl, hfPath, forward, isWide
+        angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
       );
 
       setResults((prev) => [
@@ -809,15 +951,28 @@ function App() {
       // Try to use existing uploads, or re-upload
       let acUrl = acUploadedUrlRef.current;
       let hfPath = uploadedPathRef.current;
+      let imgBase64: string | null = null;
 
       const chosenSource = source;
       const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+      const usePuter = chosenSource === "puter" || chosenSource === "auto";
       const useHF = chosenSource === "huggingface" || chosenSource === "auto";
 
       if (useAC && !acUrl) {
         try {
           acUrl = await withRetry(() => uploadToAngleChanger(imageFile), 2, 2000, "AC Upload");
           acUploadedUrlRef.current = acUrl;
+        } catch { /* will fallback */ }
+      }
+
+      if (usePuter) {
+        try {
+          imgBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(imageFile);
+          });
         } catch { /* will fallback */ }
       }
 
@@ -835,7 +990,7 @@ function App() {
 
         try {
           const result = await generateAngleWithFallback(
-            angle, chosenSource, acUrl, hfPath, forward, isWide
+            angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
           );
 
           setResults((prev) => [
@@ -992,8 +1147,9 @@ function App() {
                 })}
               </div>
               <p className="text-gray-500 text-xs mt-2">
-                {source === "auto" && "Tries AngleChanger.ai first, falls back to HuggingFace"}
+                {source === "auto" && "Tries AngleChanger → Puter.js → HuggingFace"}
                 {source === "anglechanger" && "Uses AngleChanger.ai only (more stable)"}
+                {source === "puter" && "Uses Puter.js AI (free, no API key needed)"}
                 {source === "huggingface" && "Uses HuggingFace Qwen model only"}
               </p>
             </div>
