@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useMemo, Component, type ReactNode, type ErrorInfo } from "react";
 import {
   Camera,
   Upload,
@@ -11,6 +11,40 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+
+// Error Boundary for graceful error handling
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: Error | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("App error:", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center">
+          <div className="text-center p-8">
+            <AlertCircle className="h-12 w-12 text-red-400 mx-auto mb-4" />
+            <h2 className="text-xl font-bold mb-2">Something went wrong</h2>
+            <p className="text-gray-400 mb-4">{this.state.error?.message}</p>
+            <button
+              onClick={() => { this.setState({ hasError: false, error: null }); window.location.reload(); }}
+              className="px-4 py-2 bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors"
+            >
+              Reload App
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -298,10 +332,10 @@ function App() {
     });
   };
 
-  const successCount = results.filter((r) => r.success).length;
-  const failCount = results.filter((r) => !r.success).length;
+  const successCount = useMemo(() => results.filter((r) => r.success).length, [results]);
+  const failCount = useMemo(() => results.filter((r) => !r.success).length, [results]);
 
-  const getGridItems = (): GridItem[] => {
+  const getGridItems = useCallback((): GridItem[] => {
     if (isGenerating) {
       return ANGLE_NAMES.map((name) => {
         const existing = results.find((r) => r.name === name);
@@ -309,11 +343,11 @@ function App() {
         return { name, success: false as const, pending: true as const };
       });
     }
-    // Only show successful results - hide failed ones
+    // Show all results (successful and failed) so user can retry failed ones
     return ANGLE_NAMES
       .map((name) => results.find((r) => r.name === name))
-      .filter((r): r is AngleResult => r !== undefined && r.success);
-  };
+      .filter((r): r is AngleResult => r !== undefined);
+  }, [isGenerating, results]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -583,4 +617,12 @@ function App() {
   );
 }
 
-export default App;
+function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+export default AppWithErrorBoundary;

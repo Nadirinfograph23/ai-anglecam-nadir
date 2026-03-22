@@ -75,13 +75,14 @@ def compute_image_hash(image_data: bytes) -> str:
 
 
 def clamp_rotate(deg: float) -> float:
-    if -90 <= deg <= 90:
-        return deg
-    if 90 < deg <= 180:
-        return 90.0
-    if -180 <= deg < -90:
-        return -90.0
-    return 0.0
+    """Clamp rotation to [-180, 180] range, preserving back angles."""
+    # Normalize to [-180, 180]
+    deg = deg % 360
+    if deg > 180:
+        deg -= 360
+    if deg < -180:
+        deg += 360
+    return deg
 
 
 def convert_vertical(v: float) -> float:

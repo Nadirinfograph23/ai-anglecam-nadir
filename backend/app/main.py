@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -35,6 +36,9 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="AI AngleCam Nadir", lifespan=lifespan)
+
+# GZip compression for faster response delivery
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
