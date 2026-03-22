@@ -53,12 +53,12 @@ const PREDEFINED_ANGLES = [
   { name: "Front", h: 0, v: 0 },
   { name: "Front Right", h: 45, v: 0 },
   { name: "Right", h: 90, v: 0 },
-  { name: "Back Right", h: 135, v: 0 },
-  { name: "Back", h: 180, v: 0 },
-  { name: "Back Left", h: -135, v: 0 },
+  { name: "Upper Right", h: 60, v: 30 },
+  { name: "Top View", h: 0, v: 60 },
+  { name: "Upper Left", h: -60, v: 30 },
   { name: "Left", h: -90, v: 0 },
   { name: "Front Left", h: -45, v: 0 },
-  { name: "Top View", h: 0, v: 60 },
+  { name: "Low Front", h: 0, v: -30 },
 ];
 
 const GENERATION_DEFAULTS = {
@@ -73,7 +73,8 @@ function clampRotate(deg: number): number {
   deg = deg % 360;
   if (deg > 180) deg -= 360;
   if (deg < -180) deg += 360;
-  return deg;
+  // Clamp to API's valid range [-90, 90]
+  return Math.max(-90, Math.min(90, deg));
 }
 
 function convertVertical(v: number): number {
@@ -300,8 +301,8 @@ interface PendingAngle {
 type GridItem = AngleResult | PendingAngle;
 
 const ANGLE_NAMES = [
-  "Front", "Front Right", "Right", "Back Right", "Back",
-  "Back Left", "Left", "Front Left", "Top View",
+  "Front", "Front Right", "Right", "Upper Right", "Top View",
+  "Upper Left", "Left", "Front Left", "Low Front",
 ];
 
 const LENS_OPTIONS = [

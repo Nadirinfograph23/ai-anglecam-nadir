@@ -75,14 +75,15 @@ def compute_image_hash(image_data: bytes) -> str:
 
 
 def clamp_rotate(deg: float) -> float:
-    """Clamp rotation to [-180, 180] range, preserving back angles."""
+    """Clamp rotation to [-90, 90] range (HF API valid range)."""
     # Normalize to [-180, 180]
     deg = deg % 360
     if deg > 180:
         deg -= 360
     if deg < -180:
         deg += 360
-    return deg
+    # Clamp to API's valid range [-90, 90]
+    return max(-90.0, min(90.0, deg))
 
 
 def convert_vertical(v: float) -> float:
