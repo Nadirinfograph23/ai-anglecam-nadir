@@ -15,6 +15,7 @@ from app.config import (
     PREDEFINED_ANGLES,
     STAGGER_DELAY,
 )
+from app.services.anglechanger_client import anglechanger_client
 from app.services.hf_client import (
     clamp_rotate,
     compute_image_hash,
@@ -33,6 +34,7 @@ async def lifespan(application: FastAPI):
     yield
     logger.info("Shutting down...")
     await hf_client.close()
+    await anglechanger_client.close()
 
 
 app = FastAPI(title="AI AngleCam Nadir", lifespan=lifespan)
@@ -300,4 +302,78 @@ async def retry_angle(
         })
     except Exception as e:
         logger.error("Retry for %s failed: %s", angle_name, str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== AngleChanger.ai Bot Integration =====
+
+
+class AngleChangerLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/anglechanger/login")
+async def anglechanger_login(request: AngleChangerLoginRequest):
+    """Login to AngleChanger.ai to enable bot functionality."""
+    success = await anglechanger_client.login(request.email, request.password)
+    if not success:
+        raise HTTPException(status_code=401, detail="Login to AngleChanger.ai failed")
+    return {"success": True, "message": "Logged in to AngleChanger.ai"}
+
+
+@app.post("/api/anglechanger/generate-all", response_model=GenerateAllResponse)
+async def anglechanger_generate_all(
+    image: UploadFile = File(...),
+):
+    """Generate all angle images using AngleChanger.ai as the provider."""
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    image_data = await image.read()
+    if len(image_data) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image too large. Max size is {MAX_UPLOAD_SIZE_MB}MB"
+        )
+
+    try:
+        results = await anglechanger_client.generate_all_angles(image_data)
+        successful = sum(1 for r in results if r.get("success"))
+        failed = len(results) - successful
+
+        return GenerateAllResponse(
+            results=[AngleResult(**r) for r in results],
+            total=len(results),
+            successful=successful,
+            failed=failed,
+        )
+    except Exception as e:
+        logger.error("AngleChanger.ai generation failed: %s", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/anglechanger/generate-single")
+async def anglechanger_generate_single(
+    image: UploadFile = File(...),
+    angle_name: str = Form(...),
+):
+    """Generate a single angle image using AngleChanger.ai."""
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    image_data = await image.read()
+
+    try:
+        results = await anglechanger_client.generate_all_angles(
+            image_data, angle_names=[angle_name]
+        )
+        if results and results[0].get("success"):
+            return JSONResponse(results[0])
+        error = results[0].get("error", "Generation failed") if results else "No result"
+        raise HTTPException(status_code=500, detail=error)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("AngleChanger.ai single generation failed: %s", str(e))
         raise HTTPException(status_code=500, detail=str(e))
