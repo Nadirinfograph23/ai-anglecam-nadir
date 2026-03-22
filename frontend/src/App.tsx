@@ -46,8 +46,243 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// ===== HuggingFace Gradio Space Configuration =====
+const HF_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
 
+const PREDEFINED_ANGLES = [
+  { name: "Front", h: 0, v: 0 },
+  { name: "Front Right", h: 45, v: 0 },
+  { name: "Right", h: 90, v: 0 },
+  { name: "Back Right", h: 135, v: 0 },
+  { name: "Back", h: 180, v: 0 },
+  { name: "Back Left", h: -135, v: 0 },
+  { name: "Left", h: -90, v: 0 },
+  { name: "Front Left", h: -45, v: 0 },
+  { name: "Top View", h: 0, v: 60 },
+];
+
+const GENERATION_DEFAULTS = {
+  guidanceScale: 1.0,
+  inferenceSteps: 4,
+  width: 1024,
+  height: 1024,
+};
+
+// ===== Angle Conversion Helpers =====
+function clampRotate(deg: number): number {
+  deg = deg % 360;
+  if (deg > 180) deg -= 360;
+  if (deg < -180) deg += 360;
+  return deg;
+}
+
+function convertVertical(v: number): number {
+  return Math.max(-1.0, Math.min(1.0, v / 60.0));
+}
+
+function convertForward(lens: string): number {
+  const mapping: Record<string, number> = { closeup: 5.0, wide: 0.0, normal: 2.0 };
+  return mapping[lens] ?? 2.0;
+}
+
+// ===== Image Optimization =====
+async function optimizeImage(file: File, maxSize = 2048): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      const canvas = document.createElement("canvas");
+      let { width, height } = img;
+      if (Math.max(width, height) > maxSize) {
+        const ratio = maxSize / Math.max(width, height);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) { reject(new Error("Canvas context unavailable")); return; }
+      ctx.drawImage(img, 0, 0, width, height);
+      canvas.toBlob(
+        (blob) => blob ? resolve(blob) : reject(new Error("Image conversion failed")),
+        "image/png"
+      );
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("Failed to load image"));
+    };
+    img.src = objectUrl;
+  });
+}
+
+// ===== HuggingFace Gradio API Client =====
+async function uploadToHF(imageBlob: Blob): Promise<string> {
+  const formData = new FormData();
+  formData.append("files", imageBlob, "input.png");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(HF_SPACE_URL + "/gradio_api/upload", {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error("Upload failed (" + response.status + "): " + text.slice(0, 200));
+    }
+
+    const result = await response.json();
+    if (Array.isArray(result) && result.length > 0) return result[0];
+    throw new Error("Unexpected upload response format");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseSSEForImageUrl(text: string): string {
+  const lines = text.split("\n");
+  let errorMsg = "";
+
+  for (const line of lines) {
+    if (line.startsWith("event: error")) {
+      errorMsg = "API returned an error";
+    }
+    if (line.startsWith("data: ")) {
+      const dataStr = line.substring(6).trim();
+      if (dataStr === "null") continue;
+      try {
+        const data = JSON.parse(dataStr);
+        if (errorMsg && typeof data === "string") {
+          throw new Error(data);
+        }
+        if (Array.isArray(data) && data.length > 0) {
+          const first = data[0];
+          if (first && typeof first === "object" && "url" in first) {
+            return (first as { url: string }).url;
+          }
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message !== "No image URL found") throw e;
+        continue;
+      }
+    }
+  }
+  throw new Error(errorMsg || "No image URL found in API response");
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      resolve(result.split(",")[1] || "");
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function generateSingleAngleFromHF(
+  uploadedPath: string,
+  rotateDeg: number,
+  moveForward: number,
+  verticalTilt: number,
+  wideangle: boolean,
+): Promise<{ imageData: string; contentType: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+
+  try {
+    const payload = {
+      data: [
+        false,
+        { path: uploadedPath, meta: { _type: "gradio.FileData" } },
+        rotateDeg,
+        moveForward,
+        verticalTilt,
+        wideangle,
+        0,
+        true,
+        GENERATION_DEFAULTS.guidanceScale,
+        GENERATION_DEFAULTS.inferenceSteps,
+        GENERATION_DEFAULTS.width,
+        GENERATION_DEFAULTS.height,
+        null,
+      ],
+    };
+
+    const submitResponse = await fetch(HF_SPACE_URL + "/gradio_api/call/maybe_infer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!submitResponse.ok) {
+      const text = await submitResponse.text().catch(() => "");
+      throw new Error("Generation submit failed (" + submitResponse.status + "): " + text.slice(0, 200));
+    }
+
+    const submitData = await submitResponse.json();
+    const eventId = submitData.event_id;
+    if (!eventId) throw new Error("No event_id in API response");
+
+    const resultResponse = await fetch(
+      HF_SPACE_URL + "/gradio_api/call/maybe_infer/" + eventId,
+      { signal: controller.signal }
+    );
+
+    if (!resultResponse.ok) {
+      throw new Error("Result polling failed (" + resultResponse.status + ")");
+    }
+
+    const sseText = await resultResponse.text();
+    const imageUrl = parseSSEForImageUrl(sseText);
+
+    const imageResponse = await fetch(imageUrl, { signal: controller.signal });
+    if (!imageResponse.ok) {
+      throw new Error("Image download failed (" + imageResponse.status + ")");
+    }
+
+    const blob = await imageResponse.blob();
+    const contentType = blob.type || "image/webp";
+    const imageData = await blobToBase64(blob);
+
+    return { imageData, contentType };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3,
+  baseDelay = 3000,
+  label = "",
+): Promise<T> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      console.warn("[HF] " + label + " attempt " + (attempt + 1) + "/" + maxRetries + " failed:", lastError.message);
+      if (attempt < maxRetries - 1) {
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError || new Error(label + " failed after " + maxRetries + " attempts");
+}
+
+// ===== React Types and Constants =====
 interface AngleResult {
   name: string;
   success: boolean;
@@ -129,56 +364,6 @@ function App() {
     [handleFileSelect]
   );
 
-  const processStream = async (response: Response, onResult?: (data: AngleResult) => void) => {
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error("No response stream available");
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-    const streamResults: AngleResult[] = [];
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n\n");
-      buffer = lines.pop() || "";
-
-      for (const chunk of lines) {
-        const dataLine = chunk.split("\n").find((l) => l.startsWith("data: "));
-        if (!dataLine) continue;
-
-        try {
-          const data = JSON.parse(dataLine.substring(6));
-          if (data.type === "error") {
-            setError(data.message);
-          } else if (data.type === "result") {
-            const result: AngleResult = {
-              name: data.name,
-              success: data.success,
-              image_data: data.image_data,
-              content_type: data.content_type,
-              error: data.error,
-            };
-            streamResults.push(result);
-            setResults((prev) => {
-              const existing = prev.filter((r) => r.name !== data.name);
-              return [...existing, result];
-            });
-            setProgress({ completed: data.completed, total: data.total });
-            if (onResult) onResult(result);
-          } else if (data.type === "done") {
-            setProgress({ completed: data.completed, total: data.total });
-          }
-        } catch {
-          // skip
-        }
-      }
-    }
-    return streamResults;
-  };
-
   const generateAllAngles = async () => {
     if (!imageFile) return;
     setIsGenerating(true);
@@ -186,58 +371,63 @@ function App() {
     setResults([]);
     setProgress({ completed: 0, total: 9 });
 
-    const formData = new FormData();
-    formData.append("image", imageFile);
-    formData.append("lens", lens);
-
     try {
-      const response = await fetch(API_URL + "/api/generate-stream", {
-        method: "POST",
-        body: formData,
-      });
+      const optimized = await optimizeImage(imageFile);
+      const uploadedPath = await withRetry(
+        () => uploadToHF(optimized),
+        3, 3000, "Upload"
+      );
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => null);
-        throw new Error(errData?.detail || "Server error: " + response.status);
-      }
+      const forward = convertForward(lens);
+      const isWide = lens === "wide";
+      let completedCount = 0;
 
-      const streamResults = await processStream(response);
+      const batchSize = 2;
+      for (let i = 0; i < PREDEFINED_ANGLES.length; i += batchSize) {
+        const batch = PREDEFINED_ANGLES.slice(i, i + batchSize);
 
-      // Auto-retry failed angles once
-      const failedAngles = streamResults.filter((r) => !r.success);
-      if (failedAngles.length > 0 && failedAngles.length < 9) {
-        for (const failed of failedAngles) {
+        const batchPromises = batch.map(async (angle) => {
+          const rotate = clampRotate(angle.h);
+          const tilt = convertVertical(angle.v);
+
           try {
-            const retryFormData = new FormData();
-            retryFormData.append("image", imageFile);
-            retryFormData.append("angle_name", failed.name);
-            retryFormData.append("lens", lens);
-
-            const retryResponse = await fetch(API_URL + "/api/retry-angle", {
-              method: "POST",
-              body: retryFormData,
-            });
-            if (retryResponse.ok) {
-              const data = await retryResponse.json();
-              if (data.success) {
-                setResults((prev) => {
-                  const existing = prev.filter((r) => r.name !== data.name);
-                  return [...existing, {
-                    name: data.name,
-                    success: data.success,
-                    image_data: data.image_data,
-                    content_type: data.content_type,
-                  }];
-                });
-              }
-            }
-          } catch {
-            // silent retry failure
+            const result = await withRetry(
+              () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
+              3, 4000, angle.name
+            );
+            completedCount++;
+            setProgress({ completed: completedCount, total: 9 });
+            setResults((prev) => [
+              ...prev.filter((r) => r.name !== angle.name),
+              {
+                name: angle.name,
+                success: true,
+                image_data: result.imageData,
+                content_type: result.contentType,
+              },
+            ]);
+          } catch (e) {
+            completedCount++;
+            setProgress({ completed: completedCount, total: 9 });
+            setResults((prev) => [
+              ...prev.filter((r) => r.name !== angle.name),
+              {
+                name: angle.name,
+                success: false,
+                error: e instanceof Error ? e.message : "Generation failed",
+              },
+            ]);
           }
+        });
+
+        await Promise.all(batchPromises);
+
+        if (i + batchSize < PREDEFINED_ANGLES.length) {
+          await new Promise((r) => setTimeout(r, 1500));
         }
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Generation failed");
+      setError(e instanceof Error ? e.message : "Generation failed. Please try again.");
     } finally {
       setIsGenerating(false);
     }
@@ -248,30 +438,32 @@ function App() {
     setRetryingAngle(angleName);
     setError(null);
 
-    const formData = new FormData();
-    formData.append("image", imageFile);
-    formData.append("angle_name", angleName);
-    formData.append("lens", lens);
-
     try {
-      const response = await fetch(API_URL + "/api/retry-angle", {
-        method: "POST",
-        body: formData,
-      });
-      if (!response.ok) {
-        const errData = await response.json().catch(() => null);
-        throw new Error(errData?.detail || "Retry failed: " + response.status);
-      }
-      const data = await response.json();
-      setResults((prev) => {
-        const existing = prev.filter((r) => r.name !== angleName);
-        return [...existing, {
-          name: data.name,
-          success: data.success,
-          image_data: data.image_data,
-          content_type: data.content_type,
-        }];
-      });
+      const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
+      if (!angle) throw new Error("Unknown angle: " + angleName);
+
+      const optimized = await optimizeImage(imageFile);
+      const uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+
+      const rotate = clampRotate(angle.h);
+      const forward = convertForward(lens);
+      const tilt = convertVertical(angle.v);
+      const isWide = lens === "wide";
+
+      const result = await withRetry(
+        () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
+        3, 4000, angleName
+      );
+
+      setResults((prev) => [
+        ...prev.filter((r) => r.name !== angleName),
+        {
+          name: angleName,
+          success: true,
+          image_data: result.imageData,
+          content_type: result.contentType,
+        },
+      ]);
     } catch (e) {
       setError("Retry for " + angleName + " failed: " + (e instanceof Error ? e.message : "Unknown error"));
     } finally {
@@ -286,34 +478,44 @@ function App() {
     setRetryingAll(true);
     setError(null);
 
-    for (const failed of failedResults) {
-      try {
-        const formData = new FormData();
-        formData.append("image", imageFile);
-        formData.append("angle_name", failed.name);
-        formData.append("lens", lens);
+    try {
+      const optimized = await optimizeImage(imageFile);
+      const uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
 
-        const response = await fetch(API_URL + "/api/retry-angle", {
-          method: "POST",
-          body: formData,
-        });
-        if (response.ok) {
-          const data = await response.json();
-          setResults((prev) => {
-            const existing = prev.filter((r) => r.name !== data.name);
-            return [...existing, {
-              name: data.name,
-              success: data.success,
-              image_data: data.image_data,
-              content_type: data.content_type,
-            }];
-          });
+      const forward = convertForward(lens);
+      const isWide = lens === "wide";
+
+      for (const failed of failedResults) {
+        const angle = PREDEFINED_ANGLES.find((a) => a.name === failed.name);
+        if (!angle) continue;
+
+        try {
+          const rotate = clampRotate(angle.h);
+          const tilt = convertVertical(angle.v);
+
+          const result = await withRetry(
+            () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
+            3, 4000, failed.name
+          );
+
+          setResults((prev) => [
+            ...prev.filter((r) => r.name !== failed.name),
+            {
+              name: failed.name,
+              success: true,
+              image_data: result.imageData,
+              content_type: result.contentType,
+            },
+          ]);
+        } catch {
+          // Continue with next angle
         }
-      } catch {
-        // continue with next angle
       }
+    } catch (e) {
+      setError("Retry failed: " + (e instanceof Error ? e.message : "Unknown error"));
+    } finally {
+      setRetryingAll(false);
     }
-    setRetryingAll(false);
   };
 
   const downloadImage = (result: AngleResult) => {
@@ -529,7 +731,7 @@ function App() {
                   <div className="rounded-xl bg-amber-900/30 border border-amber-700/40 p-3 flex items-start gap-2">
                     <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
                     <p className="text-amber-300 text-sm">
-                      {"تم توليد " + successCount + " صور من أصل " + (successCount + failCount) + " بسبب الضغط على الخادم. عاود المحاولة بعد قليل."}
+                      {"Some angles failed due to server load. Click 'Retry Failed' to try again."}
                     </p>
                   </div>
                 )}
