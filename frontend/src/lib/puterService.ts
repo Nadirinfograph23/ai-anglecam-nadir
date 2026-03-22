@@ -185,29 +185,3 @@ export async function generateAngleWithPuter(
     };
   }
 }
-
-/**
- * Generate all angle images using Puter.js sequentially
- * This reduces load and is more reliable than parallel generation
- */
-export async function generateAllAnglesWithPuter(
-  inputImageBase64: string,
-  onResult: (result: PuterGenerationResult, completed: number, total: number) => void,
-  timeoutPerAngle: number = 60000
-): Promise<PuterGenerationResult[]> {
-  const results: PuterGenerationResult[] = [];
-  const total = ANGLE_PROMPTS.length;
-
-  for (let i = 0; i < ANGLE_PROMPTS.length; i++) {
-    const angleConfig = ANGLE_PROMPTS[i];
-    const result = await generateAngleWithPuter(
-      inputImageBase64,
-      angleConfig,
-      timeoutPerAngle
-    );
-    results.push(result);
-    onResult(result, i + 1, total);
-  }
-
-  return results;
-}
