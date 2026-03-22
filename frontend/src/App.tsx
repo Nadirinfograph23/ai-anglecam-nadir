@@ -10,7 +10,24 @@ import {
   ImageIcon,
   Sparkles,
   X,
+  Zap,
+  Shield,
+  Globe,
 } from "lucide-react";
+
+// Puter.js global type declaration (loaded via CDN in index.html)
+declare const puter: {
+  ai: {
+    txt2img: (
+      prompt: string,
+      options?: {
+        model?: string;
+        input_image?: string;
+        test_mode?: boolean;
+      },
+    ) => Promise<HTMLImageElement>;
+  };
+};
 
 // Error Boundary for graceful error handling
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: Error | null }> {
@@ -45,6 +62,13 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
     return this.props.children;
   }
 }
+
+// ===== Generation Source Configuration =====
+type GenerationSource = "auto" | "anglechanger" | "puter" | "huggingface";
+
+// ===== AngleChanger.ai API Configuration =====
+const AC_API_BASE = "/acapi";
+const AC_IMG_BASE = "/acimg";
 
 // ===== HuggingFace Gradio Space Configuration =====
 const HF_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
@@ -83,6 +107,246 @@ function convertVertical(v: number): number {
 function convertForward(lens: string): number {
   const mapping: Record<string, number> = { closeup: 5.0, wide: 0.0, normal: 2.0 };
   return mapping[lens] ?? 2.0;
+}
+
+// ===== AngleChanger.ai API Client =====
+async function uploadToAngleChanger(imageFile: File): Promise<string> {
+  const formData = new FormData();
+  formData.append("image", imageFile);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(AC_API_BASE + "/upload.php", {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error("AC upload failed (" + response.status + "): " + text.slice(0, 200));
+    }
+
+    const result = await response.json();
+    if (result.success && result.data && result.data.url) {
+      return result.data.url;
+    }
+    throw new Error(result.error || result.message || "AC upload returned unexpected format");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function convertAngleForAC(h: number): number {
+  // AngleChanger.ai inverts horizontal angle: (360 - h) % 360
+  // Our h can be negative, so normalize first
+  const normalized = ((h % 360) + 360) % 360;
+  return (360 - normalized) % 360;
+}
+
+async function generateFromAngleChanger(
+  imageUrl: string,
+  hAngle: number,
+  vAngle: number,
+  zoom: number = 5,
+  resolution: string = "sd",
+): Promise<{ requestId: string; imageId: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const payload = {
+      image_url: imageUrl,
+      horizontal_angle: convertAngleForAC(hAngle),
+      vertical_angle: Math.max(-30, Math.min(90, vAngle)),
+      zoom: zoom,
+      resolution: resolution,
+    };
+
+    const response = await fetch(AC_API_BASE + "/generate.php", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error("AC generate failed (" + response.status + "): " + text.slice(0, 200));
+    }
+
+    const result = await response.json();
+    if (result.success && result.data) {
+      return {
+        requestId: result.data.request_id,
+        imageId: result.data.image_id,
+      };
+    }
+    // Check for limit or credits errors
+    const errMsg = result.error || result.message || "AC generation failed";
+    if (errMsg.toLowerCase().includes("limit") || errMsg.toLowerCase().includes("credit")) {
+      throw new Error("AC_LIMIT: " + errMsg);
+    }
+    throw new Error(errMsg);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function pollAngleChangerStatus(
+  requestId: string,
+  imageId: string,
+  maxAttempts: number = 60,
+): Promise<string> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const response = await fetch(
+        AC_API_BASE + "/check-status.php?request_id=" + encodeURIComponent(requestId) + "&image_id=" + encodeURIComponent(imageId),
+        { signal: controller.signal }
+      );
+
+      if (!response.ok) {
+        throw new Error("AC status check failed (" + response.status + ")");
+      }
+
+      const result = await response.json();
+      if (result.success && result.data) {
+        if (result.data.status === "completed" && result.data.result_url) {
+          return result.data.result_url;
+        }
+        if (result.data.status === "failed") {
+          throw new Error("AC generation failed on server");
+        }
+        // Still processing, continue polling
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.includes("AC generation failed")) throw e;
+      // Network error during poll, retry
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // Wait 2 seconds between polls
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("AC generation timed out after polling");
+}
+
+async function fetchACImageAsBase64(resultUrl: string): Promise<{ imageData: string; contentType: string }> {
+  // If the URL is relative, prefix with AC image proxy base
+  let fetchUrl = resultUrl;
+  if (!resultUrl.startsWith("http")) {
+    fetchUrl = AC_IMG_BASE + "/" + resultUrl.replace(/^\//, "");
+  } else if (resultUrl.includes("anglechanger.ai")) {
+    // Convert absolute anglechanger.ai URL to proxy URL
+    const path = resultUrl.replace(/^https?:\/\/anglechanger\.ai\//, "");
+    fetchUrl = AC_IMG_BASE + "/" + path;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const response = await fetch(fetchUrl, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error("AC image download failed (" + response.status + ")");
+    }
+    const blob = await response.blob();
+    const contentType = blob.type || "image/png";
+    const imageData = await blobToBase64(blob);
+    return { imageData, contentType };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateSingleAngleFromAC(
+  acUploadedUrl: string,
+  angle: { name: string; h: number; v: number },
+): Promise<{ imageData: string; contentType: string }> {
+  // Step 1: Submit generation request
+  const { requestId, imageId } = await generateFromAngleChanger(
+    acUploadedUrl,
+    angle.h,
+    angle.v,
+  );
+
+  // Step 2: Poll for completion
+  const resultUrl = await pollAngleChangerStatus(requestId, imageId);
+
+  // Step 3: Fetch the result image and convert to base64
+  return await fetchACImageAsBase64(resultUrl);
+}
+
+// ===== Puter.js API Client =====
+function buildAnglePrompt(angle: { name: string; h: number; v: number }): string {
+  const directionMap: Record<string, string> = {
+    "Front": "from directly in front, facing the subject head-on",
+    "Front Right": "from the front-right at approximately 45 degrees",
+    "Right": "from the right side at 90 degrees",
+    "Back Right": "from the back-right at approximately 135 degrees",
+    "Back": "from directly behind the subject at 180 degrees",
+    "Back Left": "from the back-left at approximately 225 degrees",
+    "Left": "from the left side at 270 degrees",
+    "Front Left": "from the front-left at approximately 315 degrees",
+    "Top View": "from above, looking down at approximately 60 degrees elevation",
+  };
+  const direction = directionMap[angle.name] || "from a " + angle.h + " degree horizontal angle";
+  return "Render this same object or scene viewed " + direction +
+    ". Maintain the same subject, lighting, colors, and style. " +
+    "Change only the camera viewing angle. Keep the background consistent.";
+}
+
+function imageElementToBase64(imgEl: HTMLImageElement): Promise<{ imageData: string; contentType: string }> {
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = imgEl.naturalWidth || imgEl.width || 1024;
+    canvas.height = imgEl.naturalHeight || imgEl.height || 1024;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) { reject(new Error("Canvas context unavailable")); return; }
+    ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) { reject(new Error("Canvas toBlob failed")); return; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = reader.result as string;
+          resolve({
+            imageData: result.split(",")[1] || "",
+            contentType: blob.type || "image/png",
+          });
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      },
+      "image/png"
+    );
+  });
+}
+
+async function generateSingleAngleFromPuter(
+  imageBase64: string,
+  angle: { name: string; h: number; v: number },
+): Promise<{ imageData: string; contentType: string }> {
+  if (typeof puter === "undefined") {
+    throw new Error("Puter.js SDK not loaded");
+  }
+
+  const prompt = buildAnglePrompt(angle);
+  // Remove data URI prefix if present, puter expects raw base64
+  const rawBase64 = imageBase64.includes(",") ? imageBase64.split(",")[1] : imageBase64;
+
+  const imgElement = await puter.ai.txt2img(prompt, {
+    model: "gemini-2.5-flash-preview-image-generation",
+    input_image: rawBase64,
+  });
+
+  return await imageElementToBase64(imgElement);
 }
 
 // ===== Image Optimization =====
@@ -314,6 +578,13 @@ function isPending(item: GridItem): item is PendingAngle {
   return "pending" in item && item.pending === true;
 }
 
+const SOURCE_OPTIONS: { value: GenerationSource; label: string; icon: typeof Zap }[] = [
+  { value: "auto", label: "Auto", icon: Zap },
+  { value: "anglechanger", label: "AngleChanger", icon: Shield },
+  { value: "puter", label: "Puter.js", icon: Globe },
+  { value: "huggingface", label: "HuggingFace", icon: Sparkles },
+];
+
 function App() {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -325,8 +596,11 @@ function App() {
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
   const [imageCount, setImageCount] = useState<number | null>(null);
+  const [source, setSource] = useState<GenerationSource>("auto");
+  const [activeSource, setActiveSource] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadedPathRef = useRef<string | null>(null);
+  const acUploadedUrlRef = useRef<string | null>(null);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -341,6 +615,7 @@ function App() {
     setError(null);
     setResults([]);
     uploadedPathRef.current = null;
+    acUploadedUrlRef.current = null;
     const reader = new FileReader();
     reader.onload = (e) => setSelectedImage(e.target?.result as string);
     reader.readAsDataURL(file);
@@ -357,6 +632,76 @@ function App() {
 
   const selectedAngleCount = imageCount || 9;
 
+  // Generate a single angle using the selected source with auto-fallback
+  const generateAngleWithFallback = async (
+    angle: { name: string; h: number; v: number },
+    chosenSource: GenerationSource,
+    acUrl: string | null,
+    hfPath: string | null,
+    forward: number,
+    isWide: boolean,
+    imageBase64?: string | null,
+  ): Promise<{ imageData: string; contentType: string }> => {
+    const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+    const usePuter = chosenSource === "puter" || chosenSource === "auto";
+    const useHF = chosenSource === "huggingface" || chosenSource === "auto";
+
+    // Try AngleChanger first (if selected or auto)
+    if (useAC && acUrl) {
+      try {
+        const result = await withRetry(
+          () => generateSingleAngleFromAC(acUrl, angle),
+          2, 2000, "[AC] " + angle.name
+        );
+        return result;
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : "";
+        console.warn("[AC] Failed for " + angle.name + ":", errMsg);
+        if (chosenSource === "auto" && usePuter && imageBase64) {
+          console.log("[AUTO] Falling back to Puter.js for " + angle.name);
+          setActiveSource("Puter.js (fallback)");
+        } else if (chosenSource === "auto" && useHF && hfPath) {
+          console.log("[AUTO] Falling back to HuggingFace for " + angle.name);
+          setActiveSource("HuggingFace (fallback)");
+        } else if (chosenSource === "anglechanger") {
+          throw e; // No fallback available
+        }
+      }
+    }
+
+    // Try Puter.js (if selected or as fallback)
+    if (usePuter && imageBase64) {
+      try {
+        const result = await withRetry(
+          () => generateSingleAngleFromPuter(imageBase64, angle),
+          2, 3000, "[Puter] " + angle.name
+        );
+        return result;
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : "";
+        console.warn("[Puter] Failed for " + angle.name + ":", errMsg);
+        if (chosenSource === "auto" && useHF && hfPath) {
+          console.log("[AUTO] Falling back to HuggingFace for " + angle.name);
+          setActiveSource("HuggingFace (fallback)");
+        } else if (chosenSource === "puter") {
+          throw e; // No fallback available
+        }
+      }
+    }
+
+    // Try HuggingFace (if selected or as fallback)
+    if (useHF && hfPath) {
+      const rotate = clampRotate(angle.h);
+      const tilt = convertVertical(angle.v);
+      return await withRetry(
+        () => generateSingleAngleFromHF(hfPath, rotate, forward, tilt, isWide),
+        4, 3000, "[HF] " + angle.name
+      );
+    }
+
+    throw new Error("No generation source available for " + angle.name);
+  };
+
   const generateAllAngles = async () => {
     if (!imageFile || !imageCount) return;
     setIsGenerating(true);
@@ -365,31 +710,89 @@ function App() {
     const total = imageCount;
     setProgress({ completed: 0, total });
 
+    const chosenSource = source;
+    const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+    const usePuter = chosenSource === "puter" || chosenSource === "auto";
+    const useHF = chosenSource === "huggingface" || chosenSource === "auto";
+
     try {
-      const optimized = await optimizeImage(imageFile);
-      const uploadedPath = await withRetry(
-        () => uploadToHF(optimized),
-        3, 3000, "Upload"
-      );
-      uploadedPathRef.current = uploadedPath;
+      // Upload to sources in parallel
+      let acUrl: string | null = null;
+      let hfPath: string | null = null;
+      let imgBase64: string | null = null;
+
+      // Prepare base64 for Puter.js (no upload needed, just read image)
+      if (usePuter) {
+        try {
+          imgBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(imageFile);
+          });
+        } catch (e) {
+          console.warn("[Puter] Image read failed:", e instanceof Error ? e.message : e);
+        }
+      }
+
+      if (useAC) {
+        setActiveSource("AngleChanger.ai");
+        try {
+          acUrl = await withRetry(
+            () => uploadToAngleChanger(imageFile),
+            2, 2000, "AC Upload"
+          );
+          acUploadedUrlRef.current = acUrl;
+        } catch (e) {
+          console.warn("[AC] Upload failed:", e instanceof Error ? e.message : e);
+          if (chosenSource === "anglechanger") {
+            throw new Error("AngleChanger.ai upload failed: " + (e instanceof Error ? e.message : "Unknown error"));
+          }
+          // In auto mode, will fallback to Puter.js or HF
+        }
+      }
+
+      if (chosenSource === "puter") {
+        setActiveSource("Puter.js");
+        if (!imgBase64) {
+          throw new Error("Failed to read image for Puter.js generation.");
+        }
+      }
+
+      if (useHF && (!acUrl || chosenSource === "auto")) {
+        if (!acUrl && !imgBase64) setActiveSource("HuggingFace");
+        try {
+          const optimized = await optimizeImage(imageFile);
+          hfPath = await withRetry(
+            () => uploadToHF(optimized),
+            3, 3000, "HF Upload"
+          );
+          uploadedPathRef.current = hfPath;
+        } catch (e) {
+          console.warn("[HF] Upload failed:", e instanceof Error ? e.message : e);
+          if (!acUrl && !imgBase64) {
+            throw new Error("All upload sources failed. Please try again.");
+          }
+          // Other sources available, continue
+        }
+      }
+
+      if (!acUrl && !imgBase64 && !hfPath) {
+        throw new Error("Failed to upload image to any generation source.");
+      }
 
       const forward = convertForward(lens);
       const isWide = lens === "wide";
       let completedCount = 0;
       const anglesToGenerate = PREDEFINED_ANGLES.slice(0, total);
 
-      const batchSize = 2;
-      for (let i = 0; i < anglesToGenerate.length; i += batchSize) {
-        const batch = anglesToGenerate.slice(i, i + batchSize);
-
-        const batchPromises = batch.map(async (angle) => {
-          const rotate = clampRotate(angle.h);
-          const tilt = convertVertical(angle.v);
-
+      // Generate angles sequentially for AC/Puter (to avoid rate limits), batched for HF-only
+      if ((acUrl && (chosenSource === "anglechanger" || chosenSource === "auto")) || chosenSource === "puter") {
+        // Sequential to respect rate limits
+        for (const angle of anglesToGenerate) {
           try {
-            const result = await withRetry(
-              () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-              4, 3000, angle.name
+            const result = await generateAngleWithFallback(
+              angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
             );
             completedCount++;
             setProgress({ completed: completedCount, total });
@@ -414,18 +817,55 @@ function App() {
               },
             ]);
           }
-        });
+        }
+      } else {
+        // Batch mode for HuggingFace only
+        const batchSize = 2;
+        for (let i = 0; i < anglesToGenerate.length; i += batchSize) {
+          const batch = anglesToGenerate.slice(i, i + batchSize);
 
-        await Promise.all(batchPromises);
+          const batchPromises = batch.map(async (angle) => {
+            try {
+              const result = await generateAngleWithFallback(
+                angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
+              );
+              completedCount++;
+              setProgress({ completed: completedCount, total });
+              setResults((prev) => [
+                ...prev.filter((r) => r.name !== angle.name),
+                {
+                  name: angle.name,
+                  success: true,
+                  image_data: result.imageData,
+                  content_type: result.contentType,
+                },
+              ]);
+            } catch (e) {
+              completedCount++;
+              setProgress({ completed: completedCount, total });
+              setResults((prev) => [
+                ...prev.filter((r) => r.name !== angle.name),
+                {
+                  name: angle.name,
+                  success: false,
+                  error: e instanceof Error ? e.message : "Generation failed",
+                },
+              ]);
+            }
+          });
 
-        if (i + batchSize < anglesToGenerate.length) {
-          await new Promise((r) => setTimeout(r, 1000));
+          await Promise.all(batchPromises);
+
+          if (i + batchSize < anglesToGenerate.length) {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
         }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed. Please try again.");
     } finally {
       setIsGenerating(false);
+      setActiveSource("");
     }
   };
 
@@ -438,21 +878,47 @@ function App() {
       const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
       if (!angle) throw new Error("Unknown angle: " + angleName);
 
-      let uploadedPath = uploadedPathRef.current;
-      if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
-        uploadedPathRef.current = uploadedPath;
-      }
-
-      const rotate = clampRotate(angle.h);
       const forward = convertForward(lens);
-      const tilt = convertVertical(angle.v);
       const isWide = lens === "wide";
 
-      const result = await withRetry(
-        () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-        4, 2000, angleName
+      // Try to use existing uploads, or re-upload
+      let acUrl = acUploadedUrlRef.current;
+      let hfPath = uploadedPathRef.current;
+      let imgBase64: string | null = null;
+
+      const chosenSource = source;
+      const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+      const usePuter = chosenSource === "puter" || chosenSource === "auto";
+      const useHF = chosenSource === "huggingface" || chosenSource === "auto";
+
+      if (useAC && !acUrl) {
+        try {
+          acUrl = await withRetry(() => uploadToAngleChanger(imageFile), 2, 2000, "AC Upload");
+          acUploadedUrlRef.current = acUrl;
+        } catch { /* will fallback */ }
+      }
+
+      if (usePuter) {
+        try {
+          imgBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(imageFile);
+          });
+        } catch { /* will fallback */ }
+      }
+
+      if (useHF && !hfPath) {
+        try {
+          const optimized = await optimizeImage(imageFile);
+          hfPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "HF Upload");
+          uploadedPathRef.current = hfPath;
+        } catch { /* will throw below if no source available */ }
+      }
+
+      const result = await generateAngleWithFallback(
+        angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
       );
 
       setResults((prev) => [
@@ -479,27 +945,52 @@ function App() {
     setError(null);
 
     try {
-      let uploadedPath = uploadedPathRef.current;
-      if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
-        uploadedPathRef.current = uploadedPath;
-      }
-
       const forward = convertForward(lens);
       const isWide = lens === "wide";
+
+      // Try to use existing uploads, or re-upload
+      let acUrl = acUploadedUrlRef.current;
+      let hfPath = uploadedPathRef.current;
+      let imgBase64: string | null = null;
+
+      const chosenSource = source;
+      const useAC = chosenSource === "anglechanger" || chosenSource === "auto";
+      const usePuter = chosenSource === "puter" || chosenSource === "auto";
+      const useHF = chosenSource === "huggingface" || chosenSource === "auto";
+
+      if (useAC && !acUrl) {
+        try {
+          acUrl = await withRetry(() => uploadToAngleChanger(imageFile), 2, 2000, "AC Upload");
+          acUploadedUrlRef.current = acUrl;
+        } catch { /* will fallback */ }
+      }
+
+      if (usePuter) {
+        try {
+          imgBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(imageFile);
+          });
+        } catch { /* will fallback */ }
+      }
+
+      if (useHF && !hfPath) {
+        try {
+          const optimized = await optimizeImage(imageFile);
+          hfPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "HF Upload");
+          uploadedPathRef.current = hfPath;
+        } catch { /* will throw if no source */ }
+      }
 
       for (const failed of failedResults) {
         const angle = PREDEFINED_ANGLES.find((a) => a.name === failed.name);
         if (!angle) continue;
 
         try {
-          const rotate = clampRotate(angle.h);
-          const tilt = convertVertical(angle.v);
-
-          const result = await withRetry(
-            () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-            3, 4000, failed.name
+          const result = await generateAngleWithFallback(
+            angle, chosenSource, acUrl, hfPath, forward, isWide, imgBase64
           );
 
           setResults((prev) => [
@@ -576,8 +1067,8 @@ function App() {
               </div>
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-500">
-              <Sparkles className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Powered by Qwen Image Edit</span>
+              <Zap className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Multi-Source AI Engine</span>
             </div>
           </div>
         </div>
@@ -632,6 +1123,35 @@ function App() {
                   className="hidden"
                 />
               </div>
+            </div>
+
+            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+              <h3 className="text-white font-semibold mb-3">Generation Source</h3>
+              <div className="flex gap-2">
+                {SOURCE_OPTIONS.map((opt) => {
+                  const Icon = opt.icon;
+                  return (
+                    <button
+                      key={opt.value}
+                      onClick={() => setSource(opt.value)}
+                      className={"flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-all " + (
+                        source === opt.value
+                          ? "bg-white text-gray-900"
+                          : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+                      )}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-gray-500 text-xs mt-2">
+                {source === "auto" && "Tries AngleChanger → Puter.js → HuggingFace"}
+                {source === "anglechanger" && "Uses AngleChanger.ai only (more stable)"}
+                {source === "puter" && "Uses Puter.js AI (free, no API key needed)"}
+                {source === "huggingface" && "Uses HuggingFace Qwen model only"}
+              </p>
             </div>
 
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
@@ -709,6 +1229,9 @@ function App() {
                 </div>
                 <p className="text-center text-gray-400 text-xs mt-2">
                   {progress.completed + "/" + progress.total + " angles completed"}
+                  {activeSource && (
+                    <span className="ml-1 text-cyan-400">{"via " + activeSource}</span>
+                  )}
                 </p>
               </div>
             )}
