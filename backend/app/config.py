@@ -26,15 +26,18 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 # Retry configuration
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
-RETRY_MAX_DELAY = 30.0  # seconds
+MAX_RETRIES = 4
+RETRY_BASE_DELAY = 3.0  # seconds
+RETRY_MAX_DELAY = 45.0  # seconds
 
 # Per-angle timeout (seconds) - prevents hanging indefinitely
 ANGLE_TIMEOUT = 120
 
 # Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 3
+MAX_CONCURRENT_GENERATIONS = 2
+
+# Stagger delay between launching tasks (seconds)
+STAGGER_DELAY = 1.5
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results
