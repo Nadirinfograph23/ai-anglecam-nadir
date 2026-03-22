@@ -46,18 +46,18 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-// ===== HuggingFace Gradio Space Configuration =====
+// ===== Provider Configuration =====
 const HF_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
 
 const PREDEFINED_ANGLES = [
   { name: "Front", h: 0, v: 0 },
-  { name: "Front Right", h: 45, v: 0 },
+  { name: "Front Right", h: 45, v: 5 },
   { name: "Right", h: 90, v: 0 },
-  { name: "Back Right", h: 135, v: 0 },
+  { name: "Back Right", h: 135, v: 5 },
   { name: "Back", h: 180, v: 0 },
-  { name: "Back Left", h: -135, v: 0 },
+  { name: "Back Left", h: -135, v: 5 },
   { name: "Left", h: -90, v: 0 },
-  { name: "Front Left", h: -45, v: 0 },
+  { name: "Front Left", h: -45, v: 5 },
   { name: "Top View", h: 0, v: 60 },
 ];
 
@@ -67,6 +67,30 @@ const GENERATION_DEFAULTS = {
   width: 1024,
   height: 1024,
 };
+
+// Circuit breaker state for HF provider
+let hfFailureCount = 0;
+let hfLastFailureTime = 0;
+const HF_FAILURE_THRESHOLD = 3;
+const HF_RECOVERY_TIMEOUT = 60000; // 60 seconds
+
+function isHFAvailable(): boolean {
+  if (hfFailureCount < HF_FAILURE_THRESHOLD) return true;
+  if (Date.now() - hfLastFailureTime > HF_RECOVERY_TIMEOUT) {
+    hfFailureCount = 0;
+    return true;
+  }
+  return false;
+}
+
+function recordHFSuccess(): void {
+  hfFailureCount = 0;
+}
+
+function recordHFFailure(): void {
+  hfFailureCount++;
+  hfLastFailureTime = Date.now();
+}
 
 // ===== Angle Conversion Helpers =====
 function clampRotate(deg: number): number {
@@ -263,7 +287,7 @@ async function generateSingleAngleFromHF(
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries = 3,
-  baseDelay = 3000,
+  baseDelay = 1500,
   label = "",
 ): Promise<T> {
   let lastError: Error | null = null;
@@ -272,14 +296,100 @@ async function withRetry<T>(
       return await fn();
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn("[HF] " + label + " attempt " + (attempt + 1) + "/" + maxRetries + " failed:", lastError.message);
+      console.warn("[Provider] " + label + " attempt " + (attempt + 1) + "/" + maxRetries + " failed:", lastError.message);
       if (attempt < maxRetries - 1) {
-        const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), 15000);
         await new Promise((r) => setTimeout(r, delay));
       }
     }
   }
   throw lastError || new Error(label + " failed after " + maxRetries + " attempts");
+}
+
+// ===== Backend API Fallback =====
+// When HF fails from the frontend, we fall back to the backend API
+// which has its own provider_manager with AngleChanger.ai fallback.
+// This avoids CORS issues from calling anglechanger.ai directly.
+async function generateViaBackendAPI(
+  imageFile: Blob,
+  rotateDeg: number,
+  moveForward: number,
+  verticalTilt: number,
+  wideangle: boolean,
+): Promise<{ imageData: string; contentType: string }> {
+  const formData = new FormData();
+  formData.append("image", imageFile, "input.png");
+  formData.append("rotate_deg", String(rotateDeg));
+  formData.append("move_forward", String(moveForward));
+  formData.append("vertical_tilt", String(verticalTilt));
+  formData.append("wideangle", String(wideangle));
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 180000);
+
+  try {
+    const response = await fetch("/api/generate-single", {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "Unknown error");
+      throw new Error("Backend API failed (" + response.status + "): " + errText);
+    }
+
+    const result = await response.json();
+    if (!result.success) {
+      throw new Error("Backend API error: " + (result.detail || "Unknown"));
+    }
+
+    return { imageData: result.image_data, contentType: result.content_type };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ===== Multi-Provider Generation with Fallback =====
+async function generateAngleWithFallback(
+  uploadedHFPath: string | null,
+  originalImage: Blob,
+  rotateDeg: number,
+  moveForward: number,
+  verticalTilt: number,
+  wideangle: boolean,
+): Promise<{ imageData: string; contentType: string }> {
+  // Try HuggingFace first if available
+  if (isHFAvailable() && uploadedHFPath) {
+    try {
+      const result = await generateSingleAngleFromHF(
+        uploadedHFPath, rotateDeg, moveForward, verticalTilt, wideangle
+      );
+      recordHFSuccess();
+      return result;
+    } catch (e) {
+      console.warn("[Fallback] HF failed, trying backend API:", e instanceof Error ? e.message : e);
+      recordHFFailure();
+    }
+  }
+
+  // Fallback to backend API (which has AngleChanger.ai fallback built in)
+  try {
+    return await generateViaBackendAPI(
+      originalImage, rotateDeg, moveForward, verticalTilt, wideangle
+    );
+  } catch (e) {
+    console.warn("[Fallback] Backend API also failed:", e instanceof Error ? e.message : e);
+  }
+
+  // Last resort: try HF regardless of circuit breaker
+  if (uploadedHFPath) {
+    return await generateSingleAngleFromHF(
+      uploadedHFPath, rotateDeg, moveForward, verticalTilt, wideangle
+    );
+  }
+
+  throw new Error("No provider available for angle generation");
 }
 
 // ===== React Types and Constants =====
@@ -378,7 +488,7 @@ function App() {
       let completedCount = 0;
       const anglesToGenerate = PREDEFINED_ANGLES.slice(0, total);
 
-      const batchSize = 2;
+      const batchSize = 3;
       for (let i = 0; i < anglesToGenerate.length; i += batchSize) {
         const batch = anglesToGenerate.slice(i, i + batchSize);
 
@@ -388,8 +498,10 @@ function App() {
 
           try {
             const result = await withRetry(
-              () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-              4, 3000, angle.name
+              () => generateAngleWithFallback(
+                uploadedPath, optimized, rotate, forward, tilt, isWide
+              ),
+              3, 1500, angle.name
             );
             completedCount++;
             setProgress({ completed: completedCount, total });
@@ -419,7 +531,7 @@ function App() {
         await Promise.all(batchPromises);
 
         if (i + batchSize < anglesToGenerate.length) {
-          await new Promise((r) => setTimeout(r, 1000));
+          await new Promise((r) => setTimeout(r, 500));
         }
       }
     } catch (e) {
@@ -438,10 +550,11 @@ function App() {
       const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
       if (!angle) throw new Error("Unknown angle: " + angleName);
 
+      const optimized = await optimizeImage(imageFile);
+
       let uploadedPath = uploadedPathRef.current;
       if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 1500, "Upload");
         uploadedPathRef.current = uploadedPath;
       }
 
@@ -451,8 +564,8 @@ function App() {
       const isWide = lens === "wide";
 
       const result = await withRetry(
-        () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-        4, 2000, angleName
+        () => generateAngleWithFallback(uploadedPath, optimized, rotate, forward, tilt, isWide),
+        3, 1500, angleName
       );
 
       setResults((prev) => [
@@ -479,10 +592,11 @@ function App() {
     setError(null);
 
     try {
+      const optimized = await optimizeImage(imageFile);
+
       let uploadedPath = uploadedPathRef.current;
       if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 1500, "Upload");
         uploadedPathRef.current = uploadedPath;
       }
 
@@ -498,8 +612,8 @@ function App() {
           const tilt = convertVertical(angle.v);
 
           const result = await withRetry(
-            () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-            3, 4000, failed.name
+            () => generateAngleWithFallback(uploadedPath, optimized, rotate, forward, tilt, isWide),
+            3, 1500, failed.name
           );
 
           setResults((prev) => [

@@ -17,15 +17,15 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 # Retry configuration
-MAX_RETRIES = 4
-RETRY_BASE_DELAY = 3.0  # seconds
-RETRY_MAX_DELAY = 45.0  # seconds
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.5  # seconds (reduced for speed)
+RETRY_MAX_DELAY = 20.0  # seconds
 
 # Concurrency control - how many parallel generations at once
-MAX_CONCURRENT_GENERATIONS = 2
+MAX_CONCURRENT_GENERATIONS = 4
 
 # Stagger delay between launching tasks (seconds)
-STAGGER_DELAY = 1.5
+STAGGER_DELAY = 0.3
 
 # Cache settings
 CACHE_MAX_SIZE = 200  # max cached results
@@ -36,14 +36,15 @@ MAX_UPLOAD_SIZE_MB = 20
 UPLOAD_DIR = "/tmp/anglecam_uploads"
 
 # The 9 predefined camera angles
+# Each angle has a unique h/v combination to maximize visual diversity
 PREDEFINED_ANGLES = [
     {"name": "Front", "h": 0, "v": 0},
-    {"name": "Front Right", "h": 45, "v": 0},
+    {"name": "Front Right", "h": 45, "v": 5},
     {"name": "Right", "h": 90, "v": 0},
-    {"name": "Back Right", "h": 135, "v": 0},
+    {"name": "Back Right", "h": 135, "v": 5},
     {"name": "Back", "h": 180, "v": 0},
-    {"name": "Back Left", "h": -135, "v": 0},
+    {"name": "Back Left", "h": -135, "v": 5},
     {"name": "Left", "h": -90, "v": 0},
-    {"name": "Front Left", "h": -45, "v": 0},
+    {"name": "Front Left", "h": -45, "v": 5},
     {"name": "Top View", "h": 0, "v": 60},
 ]
