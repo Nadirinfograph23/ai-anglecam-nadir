@@ -10,6 +10,8 @@ import {
   ImageIcon,
   Sparkles,
   X,
+  SlidersHorizontal,
+  Grid3X3,
 } from "lucide-react";
 
 // Error Boundary for graceful error handling
@@ -299,6 +301,8 @@ interface PendingAngle {
 
 type GridItem = AngleResult | PendingAngle;
 
+type GenerationMode = "multi" | "single";
+
 const ANGLE_NAMES = [
   "Front", "Front Right", "Right", "Back Right", "Back",
   "Back Left", "Left", "Front Left", "Top View",
@@ -328,6 +332,12 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadedPathRef = useRef<string | null>(null);
 
+  const [mode, setMode] = useState<GenerationMode>("multi");
+  const [horizontalAngle, setHorizontalAngle] = useState(0);
+  const [verticalAngle, setVerticalAngle] = useState(0);
+  const [zoom, setZoom] = useState(5);
+  const [singleResult, setSingleResult] = useState<AngleResult | null>(null);
+
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
       setError("Please select a valid image file (JPEG, PNG, WebP)");
@@ -340,6 +350,7 @@ function App() {
     setImageFile(file);
     setError(null);
     setResults([]);
+    setSingleResult(null);
     uploadedPathRef.current = null;
     const reader = new FileReader();
     reader.onload = (e) => setSelectedImage(e.target?.result as string);
@@ -356,6 +367,46 @@ function App() {
   );
 
   const selectedAngleCount = imageCount || 9;
+
+  const generateSingleAngle = async () => {
+    if (!imageFile) return;
+    setIsGenerating(true);
+    setError(null);
+    setSingleResult(null);
+
+    try {
+      const optimized = await optimizeImage(imageFile);
+      let uploadedPath = uploadedPathRef.current;
+      if (!uploadedPath) {
+        uploadedPath = await withRetry(
+          () => uploadToHF(optimized),
+          3, 3000, "Upload"
+        );
+        uploadedPathRef.current = uploadedPath;
+      }
+
+      const rotate = clampRotate(horizontalAngle);
+      const tilt = convertVertical(verticalAngle);
+      const forward = zoom;
+      const isWide = zoom < 2;
+
+      const result = await withRetry(
+        () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
+        4, 3000, "Single Angle"
+      );
+
+      setSingleResult({
+        name: "Custom Angle",
+        success: true,
+        image_data: result.imageData,
+        content_type: result.contentType,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Generation failed. Please try again.");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
 
   const generateAllAngles = async () => {
     if (!imageFile || !imageCount) return;
@@ -585,10 +636,34 @@ function App() {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
         <div className="mb-6">
-          <h2 className="text-2xl font-bold text-white">Generate Multi-Angle Views</h2>
+          <h2 className="text-2xl font-bold text-white">Generate Angle Views</h2>
           <p className="text-gray-400 text-sm mt-1">
-            Upload an image and generate 9 different viewing angles automatically
+            Upload an image and generate viewing angles using AI
           </p>
+          <div className="flex gap-2 mt-4">
+            <button
+              onClick={() => setMode("multi")}
+              className={"flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all " + (
+                mode === "multi"
+                  ? "bg-white text-gray-900 shadow-lg"
+                  : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+              )}
+            >
+              <Grid3X3 className="h-4 w-4" />
+              Multi-Angle
+            </button>
+            <button
+              onClick={() => setMode("single")}
+              className={"flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all " + (
+                mode === "single"
+                  ? "bg-white text-gray-900 shadow-lg"
+                  : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+              )}
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+              Single Angle
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -634,83 +709,191 @@ function App() {
               </div>
             </div>
 
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
-              <h3 className="text-white font-semibold mb-3">Lens Type</h3>
-              <div className="flex gap-2">
-                {LENS_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.value}
-                    onClick={() => setLens(opt.value)}
-                    className={"px-4 py-2 rounded-lg text-sm font-medium transition-all " + (
-                      lens === opt.value
-                        ? "bg-white text-gray-900"
-                        : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
-                    )}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
-              <div className="flex items-center gap-2 mb-3">
-                <h3 className="text-white font-semibold">Number of Images</h3>
-                <span className="text-red-500">*</span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {[3, 4, 5, 6, 7, 8, 9].map((count) => (
-                  <button
-                    key={count}
-                    onClick={() => setImageCount(count)}
-                    className={"px-4 py-2 rounded-lg text-sm font-medium transition-all min-w-[3rem] " + (
-                      imageCount === count
-                        ? "bg-white text-gray-900"
-                        : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
-                    )}
-                  >
-                    {count}
-                  </button>
-                ))}
-              </div>
-              {!imageCount && (
-                <p className="text-amber-400 text-xs mt-2 flex items-center gap-1">
-                  <AlertCircle className="h-3 w-3" />
-                  Please select the number of images to generate
-                </p>
-              )}
-            </div>
-
-            <button
-              onClick={generateAllAngles}
-              disabled={!imageFile || !imageCount || isGenerating}
-              className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {isGenerating ? (
-                <>
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                  {"Generating... (" + progress.completed + "/" + progress.total + ")"}
-                </>
-              ) : (
-                <>
-                  <Sparkles className="h-5 w-5" />
-                  {imageCount ? "Generate " + imageCount + " Angles" : "Generate Angles"}
-                </>
-              )}
-            </button>
-
-            {isGenerating && (
-              <div className="rounded-xl bg-gray-800 p-3">
-                <div className="w-full bg-gray-700 rounded-full h-2">
-                  <div
-                    className="bg-gradient-to-r from-blue-500 to-cyan-500 h-2 rounded-full transition-all duration-500"
-                    style={{ width: ((progress.completed / progress.total) * 100) + "%" }}
-                  />
+            {mode === "multi" && (
+              <>
+                <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+                  <h3 className="text-white font-semibold mb-3">Lens Type</h3>
+                  <div className="flex gap-2">
+                    {LENS_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setLens(opt.value)}
+                        className={"px-4 py-2 rounded-lg text-sm font-medium transition-all " + (
+                          lens === opt.value
+                            ? "bg-white text-gray-900"
+                            : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+                        )}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <p className="text-center text-gray-400 text-xs mt-2">
-                  {progress.completed + "/" + progress.total + " angles completed"}
-                </p>
-              </div>
+
+                <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+                  <div className="flex items-center gap-2 mb-3">
+                    <h3 className="text-white font-semibold">Number of Images</h3>
+                    <span className="text-red-500">*</span>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {[3, 4, 5, 6, 7, 8, 9].map((count) => (
+                      <button
+                        key={count}
+                        onClick={() => setImageCount(count)}
+                        className={"px-4 py-2 rounded-lg text-sm font-medium transition-all min-w-[3rem] " + (
+                          imageCount === count
+                            ? "bg-white text-gray-900"
+                            : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+                        )}
+                      >
+                        {count}
+                      </button>
+                    ))}
+                  </div>
+                  {!imageCount && (
+                    <p className="text-amber-400 text-xs mt-2 flex items-center gap-1">
+                      <AlertCircle className="h-3 w-3" />
+                      Please select the number of images to generate
+                    </p>
+                  )}
+                </div>
+
+                <button
+                  onClick={generateAllAngles}
+                  disabled={!imageFile || !imageCount || isGenerating}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {isGenerating ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                      {"Generating... (" + progress.completed + "/" + progress.total + ")"}
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-5 w-5" />
+                      {imageCount ? "Generate " + imageCount + " Angles" : "Generate Angles"}
+                    </>
+                  )}
+                </button>
+
+                {isGenerating && (
+                  <div className="rounded-xl bg-gray-800 p-3">
+                    <div className="w-full bg-gray-700 rounded-full h-2">
+                      <div
+                        className="bg-gradient-to-r from-blue-500 to-cyan-500 h-2 rounded-full transition-all duration-500"
+                        style={{ width: ((progress.completed / progress.total) * 100) + "%" }}
+                      />
+                    </div>
+                    <p className="text-center text-gray-400 text-xs mt-2">
+                      {progress.completed + "/" + progress.total + " angles completed"}
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
+
+            {mode === "single" && (
+              <>
+                <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+                  <h3 className="text-white font-semibold mb-4">Angle Controls</h3>
+                  <div className="space-y-4">
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-sm text-gray-300">Horizontal Angle</label>
+                        <span className="text-sm font-mono text-cyan-400">{horizontalAngle}&deg;</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={-180}
+                        max={180}
+                        value={horizontalAngle}
+                        onChange={(e) => setHorizontalAngle(Number(e.target.value))}
+                        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                      />
+                      <div className="flex justify-between text-xs text-gray-500 mt-1">
+                        <span>-180&deg;</span>
+                        <span>0&deg;</span>
+                        <span>180&deg;</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-sm text-gray-300">Vertical Angle</label>
+                        <span className="text-sm font-mono text-cyan-400">{verticalAngle}&deg;</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={-60}
+                        max={60}
+                        value={verticalAngle}
+                        onChange={(e) => setVerticalAngle(Number(e.target.value))}
+                        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                      />
+                      <div className="flex justify-between text-xs text-gray-500 mt-1">
+                        <span>-60&deg;</span>
+                        <span>0&deg;</span>
+                        <span>60&deg;</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-sm text-gray-300">Zoom / Forward</label>
+                        <span className="text-sm font-mono text-cyan-400">{zoom}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={5}
+                        step={0.5}
+                        value={zoom}
+                        onChange={(e) => setZoom(Number(e.target.value))}
+                        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                      />
+                      <div className="flex justify-between text-xs text-gray-500 mt-1">
+                        <span>Wide (0)</span>
+                        <span>Close-up (5)</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+                  <h3 className="text-white font-semibold mb-3">Quick Presets</h3>
+                  <div className="grid grid-cols-3 gap-2">
+                    {PREDEFINED_ANGLES.map((angle) => (
+                      <button
+                        key={angle.name}
+                        onClick={() => { setHorizontalAngle(angle.h); setVerticalAngle(angle.v); }}
+                        className={"px-2 py-1.5 rounded-lg text-xs font-medium transition-all " + (
+                          horizontalAngle === angle.h && verticalAngle === angle.v
+                            ? "bg-cyan-600 text-white"
+                            : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+                        )}
+                      >
+                        {angle.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <button
+                  onClick={generateSingleAngle}
+                  disabled={!imageFile || isGenerating}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-cyan-500/20 transition-all hover:shadow-cyan-500/30 hover:from-cyan-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {isGenerating ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                      Generating...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-5 w-5" />
+                      Change Angle
+                    </>
+                  )}
+                </button>
+              </>
             )}
 
             {error && (
@@ -720,7 +903,7 @@ function App() {
               </div>
             )}
 
-            {results.length > 0 && !isGenerating && (
+            {mode === "multi" && results.length > 0 && !isGenerating && (
               <div className="space-y-2">
                 <div className="rounded-xl bg-gray-800/50 p-3 flex items-center justify-between text-sm">
                   <div className="flex items-center gap-4">
@@ -775,61 +958,123 @@ function App() {
 
           <div className="lg:col-span-2">
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-white font-semibold">
-                  {"Generated Angles" + (results.length > 0 ? " (" + successCount + "/" + selectedAngleCount + ")" : "")}
-                </h3>
-              </div>
+              {mode === "multi" ? (
+                <>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-white font-semibold">
+                      {"Generated Angles" + (results.length > 0 ? " (" + successCount + "/" + selectedAngleCount + ")" : "")}
+                    </h3>
+                  </div>
 
-              {results.length === 0 && !isGenerating ? (
-                <div className="flex flex-col items-center justify-center h-96 text-gray-600">
-                  <ImageIcon className="h-16 w-16 mb-4 opacity-30" />
-                  <p className="text-gray-400 font-medium">No images generated yet</p>
-                  <p className="text-gray-500 text-sm mt-1">Upload an image and click Generate to start</p>
-                </div>
+                  {results.length === 0 && !isGenerating ? (
+                    <div className="flex flex-col items-center justify-center h-96 text-gray-600">
+                      <ImageIcon className="h-16 w-16 mb-4 opacity-30" />
+                      <p className="text-gray-400 font-medium">No images generated yet</p>
+                      <p className="text-gray-500 text-sm mt-1">Upload an image and click Generate to start</p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-3 gap-3">
+                      {getGridItems().map((item) => (
+                        <div key={item.name} className="rounded-xl overflow-hidden bg-gray-800 group relative">
+                          {item.success && "image_data" in item && item.image_data ? (
+                            <>
+                              <div className="absolute top-0 left-0 right-0 z-10 bg-gradient-to-b from-black/70 to-transparent px-2 py-1.5">
+                                <span className="text-xs font-medium text-white drop-shadow-lg">{item.name}</span>
+                              </div>
+                              <img
+                                src={"data:" + (item.content_type || "image/webp") + ";base64," + item.image_data}
+                                alt={item.name}
+                                className="w-full h-auto aspect-square object-cover"
+                              />
+                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                <button
+                                  onClick={() => downloadImage(item as AngleResult)}
+                                  className="bg-white/20 backdrop-blur-sm rounded-lg p-2 hover:bg-white/30 transition-colors"
+                                >
+                                  <Download className="h-5 w-5 text-white" />
+                                </button>
+                              </div>
+                            </>
+                          ) : !isPending(item) && item.error ? (
+                            <div className="w-full aspect-square flex flex-col items-center justify-center bg-gray-800 gap-2">
+                              <span className="text-xs text-gray-400">{item.name}</span>
+                              <button
+                                onClick={() => retryAngle(item.name)}
+                                disabled={retryingAngle === item.name}
+                                className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-red-600/80 text-white hover:bg-red-500 transition-colors disabled:opacity-50"
+                              >
+                                {retryingAngle === item.name ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <RotateCcw className="h-4 w-4" />
+                                )}
+                                Retry
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="w-full aspect-square flex flex-col items-center justify-center gap-2">
+                              <span className="text-xs text-gray-500">{item.name}</span>
+                              <Loader2 className="h-6 w-6 animate-spin text-gray-500" />
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               ) : (
-                <div className="grid grid-cols-3 gap-3">
-                  {getGridItems().map((item) => (
-                    <div key={item.name} className="rounded-xl overflow-hidden bg-gray-800 group relative">
-                      {item.success && "image_data" in item && item.image_data ? (
-                        <>
-                          <img
-                            src={"data:" + (item.content_type || "image/webp") + ";base64," + item.image_data}
-                            alt={item.name}
-                            className="w-full h-auto aspect-square object-cover"
-                          />
-                          <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <button
-                              onClick={() => downloadImage(item as AngleResult)}
-                              className="bg-white/20 backdrop-blur-sm rounded-lg p-2 hover:bg-white/30 transition-colors"
-                            >
-                              <Download className="h-5 w-5 text-white" />
-                            </button>
-                          </div>
-                        </>
-                        ) : !isPending(item) && item.error ? (
-                          <div className="w-full aspect-square flex items-center justify-center bg-gray-800">
-                            <button
-                              onClick={() => retryAngle(item.name)}
-                              disabled={retryingAngle === item.name}
-                              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-red-600/80 text-white hover:bg-red-500 transition-colors disabled:opacity-50"
-                            >
-                              {retryingAngle === item.name ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                <RotateCcw className="h-4 w-4" />
-                              )}
-                              Retry
-                            </button>
-                          </div>
-                      ) : (
-                        <div className="w-full aspect-square flex items-center justify-center">
-                          <Loader2 className="h-6 w-6 animate-spin text-gray-500" />
+                <>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-white font-semibold">Single Angle Result</h3>
+                    {singleResult && singleResult.success && (
+                      <button
+                        onClick={() => downloadImage(singleResult)}
+                        className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-gradient-to-r from-blue-600 to-cyan-600 text-white hover:from-blue-500 hover:to-cyan-500 transition-colors"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        Download
+                      </button>
+                    )}
+                  </div>
+
+                  {!singleResult && !isGenerating ? (
+                    <div className="flex flex-col items-center justify-center h-96 text-gray-600">
+                      <SlidersHorizontal className="h-16 w-16 mb-4 opacity-30" />
+                      <p className="text-gray-400 font-medium">No angle generated yet</p>
+                      <p className="text-gray-500 text-sm mt-1">Adjust the sliders and click Change Angle</p>
+                    </div>
+                  ) : isGenerating ? (
+                    <div className="flex flex-col items-center justify-center h-96">
+                      <Loader2 className="h-12 w-12 animate-spin text-cyan-500 mb-4" />
+                      <p className="text-gray-400">Generating angle view...</p>
+                    </div>
+                  ) : singleResult && singleResult.success && singleResult.image_data ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {selectedImage && (
+                        <div className="rounded-xl overflow-hidden border border-gray-700">
+                          <div className="bg-gray-800 px-3 py-1.5 text-xs font-medium text-gray-400">Original</div>
+                          <img src={selectedImage} alt="Original" className="w-full h-auto aspect-square object-contain bg-gray-900" />
                         </div>
                       )}
+                      <div className="rounded-xl overflow-hidden border border-cyan-700/50">
+                        <div className="bg-gray-800 px-3 py-1.5 text-xs font-medium text-cyan-400">
+                          {"H: " + horizontalAngle + "° V: " + verticalAngle + "° Zoom: " + zoom}
+                        </div>
+                        <img
+                          src={"data:" + (singleResult.content_type || "image/webp") + ";base64," + singleResult.image_data}
+                          alt="Generated angle"
+                          className="w-full h-auto aspect-square object-contain bg-gray-900"
+                        />
+                      </div>
                     </div>
-                  ))}
-                </div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center h-96 text-gray-600">
+                      <AlertCircle className="h-12 w-12 mb-4 text-red-400 opacity-50" />
+                      <p className="text-gray-400 font-medium">Generation failed</p>
+                      <p className="text-gray-500 text-sm mt-1">Please try again with different settings</p>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>
