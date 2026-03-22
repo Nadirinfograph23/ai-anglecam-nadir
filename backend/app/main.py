@@ -12,14 +12,11 @@ from pydantic import BaseModel
 from app.config import (
     MAX_UPLOAD_SIZE_MB,
     PREDEFINED_ANGLES,
-    STAGGER_DELAY,
 )
-from app.services.hf_client import (
-    clamp_rotate,
+from app.services.provider_manager import (
     compute_image_hash,
-    convert_forward,
-    convert_vertical,
-    hf_client,
+    optimize_image,
+    provider_manager,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -29,9 +26,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     logger.info("Starting up AI AngleCam Nadir backend...")
+    logger.info("Active providers: %s", provider_manager.get_active_providers())
     yield
     logger.info("Shutting down...")
-    await hf_client.close()
+    await provider_manager.close()
 
 
 app = FastAPI(title="AI AngleCam Nadir", lifespan=lifespan)
@@ -63,7 +61,10 @@ class GenerateAllResponse(BaseModel):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "providers": provider_manager.get_active_providers(),
+    }
 
 
 @app.get("/api/angles")
@@ -75,10 +76,9 @@ async def get_angles():
 @app.post("/api/generate-single")
 async def generate_single(
     image: UploadFile = File(...),
-    rotate_deg: float = Form(0.0),
-    move_forward: float = Form(2.0),
-    vertical_tilt: float = Form(0.0),
-    wideangle: bool = Form(False),
+    h_angle: float = Form(0.0),
+    v_angle: float = Form(0.0),
+    lens: str = Form("normal"),
 ):
     """Generate a single angle image from the uploaded image."""
     if not image.content_type or not image.content_type.startswith("image/"):
@@ -93,17 +93,14 @@ async def generate_single(
 
     try:
         image_hash = compute_image_hash(image_data)
-        optimized = hf_client.optimize_image(image_data)
-        uploaded_path = await hf_client.upload_image(optimized)
+        optimized = optimize_image(image_data)
 
-        rotate = clamp_rotate(rotate_deg)
-        img_bytes, content_type = await hf_client.generate_angle(
-            uploaded_path=uploaded_path,
+        img_bytes, content_type = await provider_manager.generate_angle(
+            image_data=optimized,
             image_hash=image_hash,
-            rotate_deg=rotate,
-            move_forward=move_forward,
-            vertical_tilt=vertical_tilt,
-            wideangle=wideangle,
+            h_angle=h_angle,
+            v_angle=v_angle,
+            lens=lens,
         )
 
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -124,8 +121,8 @@ async def generate_all(
 ):
     """Generate all 9 camera angle images from the uploaded image.
 
-    Uses parallel processing with controlled concurrency, automatic retries,
-    and caching for reliability.
+    Uses multi-provider fallback with parallel processing,
+    controlled concurrency, automatic retries, and caching.
     """
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -138,12 +135,22 @@ async def generate_all(
         )
 
     try:
-        results = await hf_client.generate_all_angles(image_data, lens=lens)
+        results: list[dict] = []
+        async for item in provider_manager.generate_all_angles_stream(image_data, lens=lens):
+            if item["type"] == "result":
+                results.append(item)
+
         successful = sum(1 for r in results if r.get("success"))
         failed = len(results) - successful
 
         return GenerateAllResponse(
-            results=[AngleResult(**r) for r in results],
+            results=[AngleResult(
+                name=r["name"],
+                success=r["success"],
+                image_data=r.get("image_data"),
+                content_type=r.get("content_type"),
+                error=r.get("error"),
+            ) for r in results],
             total=len(results),
             successful=successful,
             failed=failed,
@@ -160,8 +167,8 @@ async def generate_stream(
 ):
     """Generate all 9 angles with SSE streaming progress updates.
 
-    Streams results as they complete, so the frontend can show
-    images progressively instead of waiting for all 9.
+    Uses multi-provider fallback. Streams results as they complete,
+    so the frontend can show images progressively.
     """
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -174,69 +181,22 @@ async def generate_stream(
         )
 
     async def event_stream():
-        image_hash = compute_image_hash(image_data)
-        optimized = hf_client.optimize_image(image_data)
+        total = len(PREDEFINED_ANGLES)
+        providers = provider_manager.get_active_providers()
 
+        yield f"data: {json.dumps({'type': 'start', 'total': total, 'providers': providers})}\n\n"
+
+        last_completed = 0
         try:
-            uploaded_path = await hf_client.upload_image(optimized)
+            async for item in provider_manager.generate_all_angles_stream(image_data, lens=lens):
+                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("completed"):
+                    last_completed = item["completed"]
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Upload failed: {str(e)}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             return
 
-        forward = convert_forward(lens)
-        completed = 0
-        total = len(PREDEFINED_ANGLES)
-
-        yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
-
-        # Create tasks with staggered launches to reduce API pressure
-        pending_tasks = {}
-        for i, angle in enumerate(PREDEFINED_ANGLES):
-            if i > 0:
-                await asyncio.sleep(STAGGER_DELAY)
-            rotate = clamp_rotate(float(angle["h"]))
-            tilt = convert_vertical(float(angle["v"]))
-            task = asyncio.create_task(
-                hf_client.generate_angle(
-                    uploaded_path=uploaded_path,
-                    image_hash=image_hash,
-                    rotate_deg=rotate,
-                    move_forward=forward,
-                    vertical_tilt=tilt,
-                    wideangle=(lens == "wide"),
-                )
-            )
-            pending_tasks[task] = angle["name"]
-
-            # Yield any results that completed while we were staggering
-            done_early = [t for t in pending_tasks if t.done()]
-            for task_done in done_early:
-                angle_name = pending_tasks.pop(task_done)
-                completed += 1
-                try:
-                    img_bytes, content_type = task_done.result()
-                    b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
-
-        # Yield results as they complete
-        while pending_tasks:
-            done, _ = await asyncio.wait(
-                pending_tasks.keys(),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
-                angle_name = pending_tasks.pop(task)
-                completed += 1
-                try:
-                    img_bytes, content_type = task.result()
-                    b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
-
-        yield f"data: {json.dumps({'type': 'done', 'completed': completed, 'total': total})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'completed': last_completed, 'total': total})}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -255,7 +215,7 @@ async def retry_angle(
     angle_name: str = Form(...),
     lens: str = Form("normal"),
 ):
-    """Retry generating a specific failed angle."""
+    """Retry generating a specific failed angle using multi-provider fallback."""
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -270,21 +230,15 @@ async def retry_angle(
 
     image_data = await image.read()
     image_hash = compute_image_hash(image_data)
-    optimized = hf_client.optimize_image(image_data)
+    optimized = optimize_image(image_data)
 
     try:
-        uploaded_path = await hf_client.upload_image(optimized)
-        forward = convert_forward(lens)
-        rotate = clamp_rotate(float(angle_config["h"]))
-        tilt = convert_vertical(float(angle_config["v"]))
-
-        img_bytes, content_type = await hf_client.generate_angle(
-            uploaded_path=uploaded_path,
+        img_bytes, content_type = await provider_manager.generate_angle(
+            image_data=optimized,
             image_hash=image_hash,
-            rotate_deg=rotate,
-            move_forward=forward,
-            vertical_tilt=tilt,
-            wideangle=(lens == "wide"),
+            h_angle=float(angle_config["h"]),
+            v_angle=float(angle_config["v"]),
+            lens=lens,
         )
 
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -297,3 +251,9 @@ async def retry_angle(
     except Exception as e:
         logger.error("Retry for %s failed: %s", angle_name, str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/providers")
+async def get_providers():
+    """Return the list of active providers."""
+    return {"providers": provider_manager.get_active_providers()}

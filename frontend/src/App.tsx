@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   Camera,
   Upload,
@@ -10,6 +10,7 @@ import {
   ImageIcon,
   Sparkles,
   X,
+  Zap,
 } from "lucide-react";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -66,8 +67,16 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [providers, setProviders] = useState<string[]>([]);
   const [retryingAll, setRetryingAll] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    fetch(API_URL + "/api/providers")
+      .then((r) => r.json())
+      .then((data) => setProviders(data.providers || []))
+      .catch(() => {});
+  }, []);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -335,7 +344,13 @@ function App() {
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Sparkles className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Powered by Qwen Image Edit</span>
+              <span className="hidden sm:inline">Multi-API Fallback</span>
+              {providers.length > 0 && (
+                <span className="hidden md:flex items-center gap-1 ml-2 px-2 py-0.5 rounded-full bg-green-900/30 text-green-400 border border-green-800/50">
+                  <Zap className="h-3 w-3" />
+                  {providers.length + " providers"}
+                </span>
+              )}
             </div>
           </div>
         </div>
