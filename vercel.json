@@ -3,6 +3,16 @@
   "outputDirectory": "frontend/dist",
   "installCommand": "cd frontend && npm install",
   "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/acapi/:path*",
+      "destination": "https://anglechanger.ai/api/:path*"
+    },
+    {
+      "source": "/acimg/:path*",
+      "destination": "https://anglechanger.ai/:path*"
+    }
+  ],
   "headers": [
     {
       "source": "/assets/(.*)",
