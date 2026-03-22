@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   Camera,
   Upload,
@@ -11,6 +11,18 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import {
+  isPuterAvailable,
+  generateAngleWithPuter,
+  ANGLE_PROMPTS,
+} from "./lib/puterService";
+import type { PuterGenerationResult } from "./lib/puterService";
+import {
+  canGenerate,
+  getRemainingToday,
+  getDailyLimit,
+  incrementUsage,
+} from "./lib/usageLimit";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -31,8 +43,15 @@ interface PendingAngle {
 type GridItem = AngleResult | PendingAngle;
 
 const ANGLE_NAMES = [
-  "Front", "Front Right", "Right", "Back Right", "Back",
-  "Back Left", "Left", "Front Left", "Top View",
+  "Front",
+  "Front Right",
+  "Right",
+  "Back Right",
+  "Back",
+  "Back Left",
+  "Left",
+  "Front Left",
+  "Top View",
 ];
 
 const ANGLE_LABELS: Record<string, string> = {
@@ -66,7 +85,17 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [remaining, setRemaining] = useState(getRemainingToday());
+  const [apiSource, setApiSource] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef(false);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setRemaining(getRemainingToday());
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -95,11 +124,94 @@ function App() {
   );
 
   const generateAllAngles = async () => {
-    if (!imageFile) return;
+    if (!imageFile || !selectedImage) return;
+
+    if (!canGenerate()) {
+      setError(
+        "Daily limit reached (" +
+          getDailyLimit() +
+          " generations/day). Please try again tomorrow."
+      );
+      return;
+    }
+
     setIsGenerating(true);
     setError(null);
     setResults([]);
     setProgress({ completed: 0, total: 9 });
+    setApiSource("");
+    abortRef.current = false;
+
+    // Try Puter.js first
+    if (isPuterAvailable()) {
+      setApiSource("Puter.js AI");
+      const puterSuccess = await tryGenerateWithPuter();
+      if (puterSuccess) {
+        incrementUsage();
+        setRemaining(getRemainingToday());
+        setIsGenerating(false);
+        return;
+      }
+      // Puter.js completely failed, fall back to backend
+      setError(null);
+      setResults([]);
+      setProgress({ completed: 0, total: 9 });
+    }
+
+    // Fall back to backend API
+    setApiSource("Backend API");
+    const backendSuccess = await generateWithBackend();
+    if (backendSuccess) {
+      incrementUsage();
+      setRemaining(getRemainingToday());
+    }
+    setIsGenerating(false);
+  };
+
+  const tryGenerateWithPuter = async (): Promise<boolean> => {
+    if (!selectedImage) return false;
+
+    let anySuccess = false;
+
+    for (let i = 0; i < ANGLE_PROMPTS.length; i++) {
+      if (abortRef.current) break;
+
+      const angleConfig = ANGLE_PROMPTS[i];
+      const result: PuterGenerationResult = await generateAngleWithPuter(
+        selectedImage,
+        angleConfig,
+        60000
+      );
+
+      if (result.success) anySuccess = true;
+
+      setResults((prev) => {
+        const existing = prev.filter((r) => r.name !== result.name);
+        return [
+          ...existing,
+          {
+            name: result.name,
+            success: result.success,
+            image_data: result.image_data,
+            content_type: result.content_type,
+            error: result.error,
+          },
+        ];
+      });
+      setProgress({ completed: i + 1, total: ANGLE_PROMPTS.length });
+
+      // If first 2 angles all fail, abort Puter.js and switch to backend
+      if (i >= 1 && !anySuccess) {
+        return false;
+      }
+    }
+
+    return anySuccess;
+  };
+
+  const generateWithBackend = async (): Promise<boolean> => {
+    if (!imageFile) return false;
+    let anySuccess = false;
 
     const formData = new FormData();
     formData.append("image", imageFile);
@@ -131,7 +243,9 @@ function App() {
         buffer = lines.pop() || "";
 
         for (const chunk of lines) {
-          const dataLine = chunk.split("\n").find((l) => l.startsWith("data: "));
+          const dataLine = chunk
+            .split("\n")
+            .find((l) => l.startsWith("data: "));
           if (!dataLine) continue;
 
           try {
@@ -139,15 +253,19 @@ function App() {
             if (data.type === "error") {
               setError(data.message);
             } else if (data.type === "result") {
+              if (data.success) anySuccess = true;
               setResults((prev) => {
                 const existing = prev.filter((r) => r.name !== data.name);
-                return [...existing, {
-                  name: data.name,
-                  success: data.success,
-                  image_data: data.image_data,
-                  content_type: data.content_type,
-                  error: data.error,
-                }];
+                return [
+                  ...existing,
+                  {
+                    name: data.name,
+                    success: data.success,
+                    image_data: data.image_data,
+                    content_type: data.content_type,
+                    error: data.error,
+                  },
+                ];
               });
               setProgress({ completed: data.completed, total: data.total });
             } else if (data.type === "done") {
@@ -160,16 +278,44 @@ function App() {
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed");
-    } finally {
-      setIsGenerating(false);
     }
+    return anySuccess;
   };
 
   const retryAngle = async (angleName: string) => {
-    if (!imageFile) return;
+    if (!imageFile || !selectedImage) return;
     setRetryingAngle(angleName);
     setError(null);
 
+    // Try Puter.js first for retry
+    if (isPuterAvailable()) {
+      const angleConfig = ANGLE_PROMPTS.find((a) => a.name === angleName);
+      if (angleConfig) {
+        const result: PuterGenerationResult = await generateAngleWithPuter(
+          selectedImage,
+          angleConfig,
+          60000
+        );
+        if (result.success) {
+          setResults((prev) => {
+            const existing = prev.filter((r) => r.name !== angleName);
+            return [
+              ...existing,
+              {
+                name: result.name,
+                success: result.success,
+                image_data: result.image_data,
+                content_type: result.content_type,
+              },
+            ];
+          });
+          setRetryingAngle(null);
+          return;
+        }
+      }
+    }
+
+    // Fall back to backend retry
     const formData = new FormData();
     formData.append("image", imageFile);
     formData.append("angle_name", angleName);
@@ -187,15 +333,23 @@ function App() {
       const data = await response.json();
       setResults((prev) => {
         const existing = prev.filter((r) => r.name !== angleName);
-        return [...existing, {
-          name: data.name,
-          success: data.success,
-          image_data: data.image_data,
-          content_type: data.content_type,
-        }];
+        return [
+          ...existing,
+          {
+            name: data.name,
+            success: data.success,
+            image_data: data.image_data,
+            content_type: data.content_type,
+          },
+        ];
       });
     } catch (e) {
-      setError("Retry for " + angleName + " failed: " + (e instanceof Error ? e.message : "Unknown error"));
+      setError(
+        "Retry for " +
+          angleName +
+          " failed: " +
+          (e instanceof Error ? e.message : "Unknown error")
+      );
     } finally {
       setRetryingAngle(null);
     }
@@ -205,8 +359,13 @@ function App() {
     if (!result.image_data || !result.content_type) return;
     const ext = result.content_type.includes("webp") ? "webp" : "png";
     const link = document.createElement("a");
-    link.href = "data:" + result.content_type + ";base64," + result.image_data;
-    link.download = "angle-" + result.name.toLowerCase().replace(/\s+/g, "-") + "." + ext;
+    link.href =
+      "data:" + result.content_type + ";base64," + result.image_data;
+    link.download =
+      "angle-" +
+      result.name.toLowerCase().replace(/\s+/g, "-") +
+      "." +
+      ext;
     link.click();
   };
 
@@ -228,10 +387,12 @@ function App() {
         return { name, success: false as const, pending: true as const };
       });
     }
-    return ANGLE_NAMES
-      .map((name) => results.find((r) => r.name === name))
-      .filter((r): r is AngleResult => r !== undefined);
+    return ANGLE_NAMES.map((name) =>
+      results.find((r) => r.name === name)
+    ).filter((r): r is AngleResult => r !== undefined);
   };
+
+  const limitReached = !canGenerate();
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -253,7 +414,9 @@ function App() {
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Sparkles className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Powered by Qwen Image Edit</span>
+              <span className="hidden sm:inline">
+                Powered by Puter.js AI + Qwen Image Edit
+              </span>
             </div>
           </div>
         </div>
@@ -261,9 +424,12 @@ function App() {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
         <div className="mb-6">
-          <h2 className="text-2xl font-bold text-white">Generate Multi-Angle Views</h2>
+          <h2 className="text-2xl font-bold text-white">
+            Generate Multi-Angle Views
+          </h2>
           <p className="text-gray-400 text-sm mt-1">
-            Upload an image and generate 9 different viewing angles automatically
+            Upload an image and generate 9 different viewing angles
+            automatically
           </p>
         </div>
 
@@ -274,26 +440,41 @@ function App() {
                 <h3 className="text-white font-semibold">Input Image</h3>
                 <span className="text-red-500">*</span>
               </div>
-              <div onDrop={handleDrop} onDragOver={(e) => e.preventDefault()} className="space-y-3">
+              <div
+                onDrop={handleDrop}
+                onDragOver={(e) => e.preventDefault()}
+                className="space-y-3"
+              >
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  className={"w-full flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-6 transition-all " + (
-                    selectedImage
+                  className={
+                    "w-full flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-6 transition-all " +
+                    (selectedImage
                       ? "border-gray-700 bg-gray-800/30 hover:border-cyan-500/50"
-                      : "border-gray-600 bg-gray-800/50 hover:border-cyan-400/50 hover:bg-gray-800"
-                  )}
+                      : "border-gray-600 bg-gray-800/50 hover:border-cyan-400/50 hover:bg-gray-800")
+                  }
                 >
                   <Upload className="h-8 w-8 text-gray-400" />
                   <span className="text-sm text-gray-300 font-medium">
                     {selectedImage ? "Change Image" : "Upload Image"}
                   </span>
-                  <span className="text-xs text-gray-500">JPEG, PNG, WebP (max 20MB)</span>
+                  <span className="text-xs text-gray-500">
+                    JPEG, PNG, WebP (max 20MB)
+                  </span>
                 </button>
                 {selectedImage && (
                   <div className="relative rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
-                    <img src={selectedImage} alt="Input preview" className="w-full h-auto max-h-64 object-contain" />
+                    <img
+                      src={selectedImage}
+                      alt="Input preview"
+                      className="w-full h-auto max-h-64 object-contain"
+                    />
                     <button
-                      onClick={() => { setSelectedImage(null); setImageFile(null); setResults([]); }}
+                      onClick={() => {
+                        setSelectedImage(null);
+                        setImageFile(null);
+                        setResults([]);
+                      }}
                       className="absolute top-2 right-2 p-1 rounded-full bg-gray-900/80 hover:bg-red-600 transition-colors"
                     >
                       <X className="h-4 w-4" />
@@ -304,7 +485,10 @@ function App() {
                   ref={fileInputRef}
                   type="file"
                   accept="image/jpeg,image/png,image/webp"
-                  onChange={(e) => { const file = e.target.files?.[0]; if (file) handleFileSelect(file); }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleFileSelect(file);
+                  }}
                   className="hidden"
                 />
               </div>
@@ -317,11 +501,12 @@ function App() {
                   <button
                     key={opt.value}
                     onClick={() => setLens(opt.value)}
-                    className={"px-4 py-2 rounded-lg text-sm font-medium transition-all " + (
-                      lens === opt.value
+                    className={
+                      "px-4 py-2 rounded-lg text-sm font-medium transition-all " +
+                      (lens === opt.value
                         ? "bg-white text-gray-900"
-                        : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
-                    )}
+                        : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700")
+                    }
                   >
                     {opt.label}
                   </button>
@@ -331,13 +516,22 @@ function App() {
 
             <button
               onClick={generateAllAngles}
-              disabled={!imageFile || isGenerating}
+              disabled={!imageFile || isGenerating || limitReached}
               className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  {"Generating... (" + progress.completed + "/" + progress.total + ")"}
+                  {"Generating... (" +
+                    progress.completed +
+                    "/" +
+                    progress.total +
+                    ")"}
+                </>
+              ) : limitReached ? (
+                <>
+                  <AlertCircle className="h-5 w-5" />
+                  Daily Limit Reached
                 </>
               ) : (
                 <>
@@ -347,16 +541,64 @@ function App() {
               )}
             </button>
 
+            {/* Usage limit indicator */}
+            <div className="rounded-xl bg-gray-800/50 border border-gray-700/50 p-3">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-400">Daily Usage</span>
+                <span
+                  className={
+                    remaining > 0 ? "text-cyan-400" : "text-red-400"
+                  }
+                >
+                  {remaining + "/" + getDailyLimit() + " remaining"}
+                </span>
+              </div>
+              <div className="w-full bg-gray-700 rounded-full h-1.5 mt-2">
+                <div
+                  className={
+                    "h-1.5 rounded-full transition-all duration-500 " +
+                    (remaining > 2
+                      ? "bg-gradient-to-r from-cyan-500 to-blue-500"
+                      : remaining > 0
+                        ? "bg-yellow-500"
+                        : "bg-red-500")
+                  }
+                  style={{
+                    width:
+                      (remaining / getDailyLimit()) * 100 + "%",
+                  }}
+                />
+              </div>
+              {limitReached && (
+                <p className="text-red-400 text-xs mt-2">
+                  You have reached the daily limit. Please try again tomorrow.
+                </p>
+              )}
+            </div>
+
+            {/* API source indicator */}
+            {apiSource && isGenerating && (
+              <div className="rounded-xl bg-gray-800/30 border border-gray-700/30 px-3 py-2 text-xs text-gray-400 text-center">
+                {"Generating via: " + apiSource}
+              </div>
+            )}
+
             {isGenerating && (
               <div className="rounded-xl bg-gray-800 p-3">
                 <div className="w-full bg-gray-700 rounded-full h-2">
                   <div
                     className="bg-gradient-to-r from-blue-500 to-cyan-500 h-2 rounded-full transition-all duration-500"
-                    style={{ width: ((progress.completed / progress.total) * 100) + "%" }}
+                    style={{
+                      width:
+                        (progress.completed / progress.total) * 100 + "%",
+                    }}
                   />
                 </div>
                 <p className="text-center text-gray-400 text-xs mt-2">
-                  {progress.completed + "/" + progress.total + " angles completed"}
+                  {progress.completed +
+                    "/" +
+                    progress.total +
+                    " angles completed"}
                 </p>
               </div>
             )}
@@ -399,30 +641,49 @@ function App() {
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-white font-semibold">
-                  {"Generated Angles" + (results.length > 0 ? " (" + successCount + "/9)" : "")}
+                  {"Generated Angles" +
+                    (results.length > 0
+                      ? " (" + successCount + "/9)"
+                      : "")}
                 </h3>
               </div>
 
               {results.length === 0 && !isGenerating ? (
                 <div className="flex flex-col items-center justify-center h-96 text-gray-600">
                   <ImageIcon className="h-16 w-16 mb-4 opacity-30" />
-                  <p className="text-gray-400 font-medium">No images generated yet</p>
-                  <p className="text-gray-500 text-sm mt-1">Upload an image and click Generate to start</p>
+                  <p className="text-gray-400 font-medium">
+                    No images generated yet
+                  </p>
+                  <p className="text-gray-500 text-sm mt-1">
+                    Upload an image and click Generate to start
+                  </p>
                 </div>
               ) : (
                 <div className="grid grid-cols-3 gap-3">
                   {getGridItems().map((item) => (
-                    <div key={item.name} className="rounded-xl overflow-hidden bg-gray-800 group relative">
-                      {item.success && "image_data" in item && item.image_data ? (
+                    <div
+                      key={item.name}
+                      className="rounded-xl overflow-hidden bg-gray-800 group relative"
+                    >
+                      {item.success &&
+                      "image_data" in item &&
+                      item.image_data ? (
                         <>
                           <img
-                            src={"data:" + (item.content_type || "image/webp") + ";base64," + item.image_data}
+                            src={
+                              "data:" +
+                              (item.content_type || "image/webp") +
+                              ";base64," +
+                              item.image_data
+                            }
                             alt={item.name}
                             className="w-full h-auto aspect-square object-cover"
                           />
                           <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                             <button
-                              onClick={() => downloadImage(item as AngleResult)}
+                              onClick={() =>
+                                downloadImage(item as AngleResult)
+                              }
                               className="bg-white/20 backdrop-blur-sm rounded-lg p-2 hover:bg-white/30 transition-colors"
                             >
                               <Download className="h-5 w-5 text-white" />
@@ -469,7 +730,9 @@ function App() {
 
       <footer className="border-t border-gray-800/50 mt-12 py-6 text-center">
         <p className="text-gray-500 text-sm">AI NADIR ANGLE</p>
-        <p className="text-gray-600 text-xs mt-1">&copy; 2026 Multi-Angle Image Generator</p>
+        <p className="text-gray-600 text-xs mt-1">
+          &copy; 2026 Multi-Angle Image Generator
+        </p>
       </footer>
     </div>
   );
