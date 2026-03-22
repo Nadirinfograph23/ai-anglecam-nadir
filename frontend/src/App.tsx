@@ -304,18 +304,6 @@ const ANGLE_NAMES = [
   "Back Left", "Left", "Front Left", "Top View",
 ];
 
-const ANGLE_LABELS: Record<string, string> = {
-  Front: "Front View",
-  "Front Right": "Front Right",
-  Right: "Right Side",
-  "Back Right": "Back Right",
-  Back: "Back View",
-  "Back Left": "Back Left",
-  Left: "Left Side",
-  "Front Left": "Front Left",
-  "Top View": "Top View",
-};
-
 const LENS_OPTIONS = [
   { value: "normal", label: "Normal" },
   { value: "wide", label: "Wide Angle" },
@@ -336,7 +324,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
+  const [imageCount, setImageCount] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadedPathRef = useRef<string | null>(null);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -350,6 +340,7 @@ function App() {
     setImageFile(file);
     setError(null);
     setResults([]);
+    uploadedPathRef.current = null;
     const reader = new FileReader();
     reader.onload = (e) => setSelectedImage(e.target?.result as string);
     reader.readAsDataURL(file);
@@ -364,12 +355,15 @@ function App() {
     [handleFileSelect]
   );
 
+  const selectedAngleCount = imageCount || 9;
+
   const generateAllAngles = async () => {
-    if (!imageFile) return;
+    if (!imageFile || !imageCount) return;
     setIsGenerating(true);
     setError(null);
     setResults([]);
-    setProgress({ completed: 0, total: 9 });
+    const total = imageCount;
+    setProgress({ completed: 0, total });
 
     try {
       const optimized = await optimizeImage(imageFile);
@@ -377,14 +371,16 @@ function App() {
         () => uploadToHF(optimized),
         3, 3000, "Upload"
       );
+      uploadedPathRef.current = uploadedPath;
 
       const forward = convertForward(lens);
       const isWide = lens === "wide";
       let completedCount = 0;
+      const anglesToGenerate = PREDEFINED_ANGLES.slice(0, total);
 
       const batchSize = 2;
-      for (let i = 0; i < PREDEFINED_ANGLES.length; i += batchSize) {
-        const batch = PREDEFINED_ANGLES.slice(i, i + batchSize);
+      for (let i = 0; i < anglesToGenerate.length; i += batchSize) {
+        const batch = anglesToGenerate.slice(i, i + batchSize);
 
         const batchPromises = batch.map(async (angle) => {
           const rotate = clampRotate(angle.h);
@@ -393,10 +389,10 @@ function App() {
           try {
             const result = await withRetry(
               () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-              3, 4000, angle.name
+              4, 3000, angle.name
             );
             completedCount++;
-            setProgress({ completed: completedCount, total: 9 });
+            setProgress({ completed: completedCount, total });
             setResults((prev) => [
               ...prev.filter((r) => r.name !== angle.name),
               {
@@ -408,7 +404,7 @@ function App() {
             ]);
           } catch (e) {
             completedCount++;
-            setProgress({ completed: completedCount, total: 9 });
+            setProgress({ completed: completedCount, total });
             setResults((prev) => [
               ...prev.filter((r) => r.name !== angle.name),
               {
@@ -422,8 +418,8 @@ function App() {
 
         await Promise.all(batchPromises);
 
-        if (i + batchSize < PREDEFINED_ANGLES.length) {
-          await new Promise((r) => setTimeout(r, 1500));
+        if (i + batchSize < anglesToGenerate.length) {
+          await new Promise((r) => setTimeout(r, 1000));
         }
       }
     } catch (e) {
@@ -442,8 +438,12 @@ function App() {
       const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
       if (!angle) throw new Error("Unknown angle: " + angleName);
 
-      const optimized = await optimizeImage(imageFile);
-      const uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+      let uploadedPath = uploadedPathRef.current;
+      if (!uploadedPath) {
+        const optimized = await optimizeImage(imageFile);
+        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+        uploadedPathRef.current = uploadedPath;
+      }
 
       const rotate = clampRotate(angle.h);
       const forward = convertForward(lens);
@@ -452,7 +452,7 @@ function App() {
 
       const result = await withRetry(
         () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-        3, 4000, angleName
+        4, 2000, angleName
       );
 
       setResults((prev) => [
@@ -479,8 +479,12 @@ function App() {
     setError(null);
 
     try {
-      const optimized = await optimizeImage(imageFile);
-      const uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+      let uploadedPath = uploadedPathRef.current;
+      if (!uploadedPath) {
+        const optimized = await optimizeImage(imageFile);
+        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+        uploadedPathRef.current = uploadedPath;
+      }
 
       const forward = convertForward(lens);
       const isWide = lens === "wide";
@@ -537,19 +541,21 @@ function App() {
   const successCount = useMemo(() => results.filter((r) => r.success).length, [results]);
   const failCount = useMemo(() => results.filter((r) => !r.success).length, [results]);
 
+  const activeAngleNames = useMemo(() => ANGLE_NAMES.slice(0, selectedAngleCount), [selectedAngleCount]);
+
   const getGridItems = useCallback((): GridItem[] => {
     if (isGenerating) {
-      return ANGLE_NAMES.map((name) => {
+      return activeAngleNames.map((name) => {
         const existing = results.find((r) => r.name === name);
         if (existing) return existing;
         return { name, success: false as const, pending: true as const };
       });
     }
     // Show all results (successful and failed) so user can retry failed ones
-    return ANGLE_NAMES
+    return activeAngleNames
       .map((name) => results.find((r) => r.name === name))
       .filter((r): r is AngleResult => r !== undefined);
-  }, [isGenerating, results]);
+  }, [isGenerating, results, activeAngleNames]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -647,9 +653,37 @@ function App() {
               </div>
             </div>
 
+            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <h3 className="text-white font-semibold">Number of Images</h3>
+                <span className="text-red-500">*</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {[3, 4, 5, 6, 7, 8, 9].map((count) => (
+                  <button
+                    key={count}
+                    onClick={() => setImageCount(count)}
+                    className={"px-4 py-2 rounded-lg text-sm font-medium transition-all min-w-[3rem] " + (
+                      imageCount === count
+                        ? "bg-white text-gray-900"
+                        : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
+                    )}
+                  >
+                    {count}
+                  </button>
+                ))}
+              </div>
+              {!imageCount && (
+                <p className="text-amber-400 text-xs mt-2 flex items-center gap-1">
+                  <AlertCircle className="h-3 w-3" />
+                  Please select the number of images to generate
+                </p>
+              )}
+            </div>
+
             <button
               onClick={generateAllAngles}
-              disabled={!imageFile || isGenerating}
+              disabled={!imageFile || !imageCount || isGenerating}
               className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
@@ -660,7 +694,7 @@ function App() {
               ) : (
                 <>
                   <Sparkles className="h-5 w-5" />
-                  Generate All 9 Angles
+                  {imageCount ? "Generate " + imageCount + " Angles" : "Generate Angles"}
                 </>
               )}
             </button>
@@ -743,7 +777,7 @@ function App() {
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-white font-semibold">
-                  {"Generated Angles" + (results.length > 0 ? " (" + successCount + "/9)" : "")}
+                  {"Generated Angles" + (results.length > 0 ? " (" + successCount + "/" + selectedAngleCount + ")" : "")}
                 </h3>
               </div>
 
@@ -773,35 +807,26 @@ function App() {
                             </button>
                           </div>
                         </>
-                      ) : !isPending(item) && item.error ? (
-                        <div className="w-full aspect-square flex flex-col items-center justify-center gap-2 p-3">
-                          <AlertCircle className="h-6 w-6 text-red-400" />
-                          <p className="text-red-400 text-xs text-center truncate w-full">
-                            {item.error || "Failed"}
-                          </p>
-                          <button
-                            onClick={() => retryAngle(item.name)}
-                            disabled={retryingAngle === item.name}
-                            className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-red-900/50 text-red-300 hover:bg-red-800/50 transition-colors disabled:opacity-50"
-                          >
-                            {retryingAngle === item.name ? (
-                              <Loader2 className="h-3 w-3 animate-spin" />
-                            ) : (
-                              <RotateCcw className="h-3 w-3" />
-                            )}
-                            Retry
-                          </button>
-                        </div>
+                        ) : !isPending(item) && item.error ? (
+                          <div className="w-full aspect-square flex items-center justify-center bg-gray-800">
+                            <button
+                              onClick={() => retryAngle(item.name)}
+                              disabled={retryingAngle === item.name}
+                              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-red-600/80 text-white hover:bg-red-500 transition-colors disabled:opacity-50"
+                            >
+                              {retryingAngle === item.name ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <RotateCcw className="h-4 w-4" />
+                              )}
+                              Retry
+                            </button>
+                          </div>
                       ) : (
                         <div className="w-full aspect-square flex items-center justify-center">
                           <Loader2 className="h-6 w-6 animate-spin text-gray-500" />
                         </div>
                       )}
-                      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-2">
-                        <p className="text-white text-xs font-medium text-center">
-                          {ANGLE_LABELS[item.name] || item.name}
-                        </p>
-                      </div>
                     </div>
                   ))}
                 </div>
