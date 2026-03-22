@@ -17,11 +17,10 @@ from app.config import (
 )
 from app.services.hf_client import (
     clamp_rotate,
-    compute_image_hash,
     convert_forward,
     convert_vertical,
-    hf_client,
 )
+from app.services.provider_manager import provider_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,7 +31,7 @@ async def lifespan(application: FastAPI):
     logger.info("Starting up AI AngleCam Nadir backend...")
     yield
     logger.info("Shutting down...")
-    await hf_client.close()
+    await provider_manager.close()
 
 
 app = FastAPI(title="AI AngleCam Nadir", lifespan=lifespan)
@@ -56,6 +55,7 @@ class AngleResult(BaseModel):
     image_data: str | None = None
     content_type: str | None = None
     error: str | None = None
+    provider: str | None = None
 
 
 class GenerateAllResponse(BaseModel):
@@ -68,6 +68,12 @@ class GenerateAllResponse(BaseModel):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/api/provider-status")
+async def get_provider_status():
+    """Return current health status of all generation providers."""
+    return provider_manager.get_provider_status()
 
 
 @app.get("/api/angles")
@@ -96,18 +102,14 @@ async def generate_single(
         )
 
     try:
-        image_hash = compute_image_hash(image_data)
-        optimized = hf_client.optimize_image(image_data)
-        uploaded_path = await hf_client.upload_image(optimized)
-
         rotate = clamp_rotate(rotate_deg)
-        img_bytes, content_type = await hf_client.generate_angle(
-            uploaded_path=uploaded_path,
-            image_hash=image_hash,
+        img_bytes, content_type, provider = await provider_manager.generate_angle(
+            image_data=image_data,
             rotate_deg=rotate,
             move_forward=move_forward,
             vertical_tilt=vertical_tilt,
             wideangle=wideangle,
+            v_raw=vertical_tilt * 60.0,
         )
 
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -115,6 +117,7 @@ async def generate_single(
             "success": True,
             "image_data": b64,
             "content_type": content_type,
+            "provider": provider,
         })
     except Exception as e:
         logger.error("Single generation failed: %s", str(e))
@@ -142,7 +145,7 @@ async def generate_all(
         )
 
     try:
-        results = await hf_client.generate_all_angles(image_data, lens=lens)
+        results = await provider_manager.generate_all_angles(image_data, lens=lens)
         successful = sum(1 for r in results if r.get("success"))
         failed = len(results) - successful
 
@@ -178,15 +181,6 @@ async def generate_stream(
         )
 
     async def event_stream():
-        image_hash = compute_image_hash(image_data)
-        optimized = hf_client.optimize_image(image_data)
-
-        try:
-            uploaded_path = await hf_client.upload_image(optimized)
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Upload failed: {str(e)}'})}\n\n"
-            return
-
         forward = convert_forward(lens)
         completed = 0
         total = len(PREDEFINED_ANGLES)
@@ -201,13 +195,13 @@ async def generate_stream(
             rotate = clamp_rotate(float(angle["h"]))
             tilt = convert_vertical(float(angle["v"]))
             task = asyncio.create_task(
-                hf_client.generate_angle(
-                    uploaded_path=uploaded_path,
-                    image_hash=image_hash,
+                provider_manager.generate_angle(
+                    image_data=image_data,
                     rotate_deg=rotate,
                     move_forward=forward,
                     vertical_tilt=tilt,
                     wideangle=(lens == "wide"),
+                    v_raw=float(angle["v"]),
                 )
             )
             pending_tasks[task] = angle["name"]
@@ -218,9 +212,9 @@ async def generate_stream(
                 angle_name = pending_tasks.pop(task_done)
                 completed += 1
                 try:
-                    img_bytes, content_type = task_done.result()
+                    img_bytes, content_type, provider = task_done.result()
                     b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
+                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'provider': provider, 'completed': completed, 'total': total})}\n\n"
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
 
@@ -234,9 +228,9 @@ async def generate_stream(
                 angle_name = pending_tasks.pop(task)
                 completed += 1
                 try:
-                    img_bytes, content_type = task.result()
+                    img_bytes, content_type, provider = task.result()
                     b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
+                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'provider': provider, 'completed': completed, 'total': total})}\n\n"
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
 
@@ -273,22 +267,19 @@ async def retry_angle(
         raise HTTPException(status_code=400, detail=f"Unknown angle: {angle_name}")
 
     image_data = await image.read()
-    image_hash = compute_image_hash(image_data)
-    optimized = hf_client.optimize_image(image_data)
 
     try:
-        uploaded_path = await hf_client.upload_image(optimized)
         forward = convert_forward(lens)
         rotate = clamp_rotate(float(angle_config["h"]))
         tilt = convert_vertical(float(angle_config["v"]))
 
-        img_bytes, content_type = await hf_client.generate_angle(
-            uploaded_path=uploaded_path,
-            image_hash=image_hash,
+        img_bytes, content_type, provider = await provider_manager.generate_angle(
+            image_data=image_data,
             rotate_deg=rotate,
             move_forward=forward,
             vertical_tilt=tilt,
             wideangle=(lens == "wide"),
+            v_raw=float(angle_config["v"]),
         )
 
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -297,6 +288,7 @@ async def retry_angle(
             "success": True,
             "image_data": b64,
             "content_type": content_type,
+            "provider": provider,
         })
     except Exception as e:
         logger.error("Retry for %s failed: %s", angle_name, str(e))
