@@ -187,6 +187,9 @@ async def generate_stream(
 
         yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
 
+        # Upload once and share the paths across all angle generations
+        hf_path, ac_url = await provider_manager.upload_once(image_data)
+
         # Create tasks with staggered launches to reduce API pressure
         pending_tasks = {}
         for i, angle in enumerate(PREDEFINED_ANGLES):
@@ -202,6 +205,8 @@ async def generate_stream(
                     vertical_tilt=tilt,
                     wideangle=(lens == "wide"),
                     v_raw=float(angle["v"]),
+                    hf_uploaded_path=hf_path,
+                    ac_uploaded_url=ac_url,
                 )
             )
             pending_tasks[task] = angle["name"]

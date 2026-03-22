@@ -10,7 +10,6 @@ from app.config import PREDEFINED_ANGLES
 from app.services.anglechanger_client import anglechanger_client
 from app.services.hf_client import (
     clamp_rotate,
-    compute_image_hash,
     convert_forward,
     convert_vertical,
     hf_client,
@@ -94,6 +93,34 @@ class ProviderManager:
         await hf_client.close()
         await anglechanger_client.close()
 
+    async def upload_once(self, image_data: bytes) -> tuple[str | None, str | None]:
+        """Upload image once to both providers, returning (hf_path, ac_url).
+
+        Failures are non-fatal; the caller checks which uploads succeeded.
+        """
+        optimized = hf_client.optimize_image(image_data)
+
+        hf_path: str | None = None
+        ac_url: str | None = None
+
+        # Upload to both providers in parallel
+        async def _upload_hf() -> str | None:
+            try:
+                return await hf_client.upload_image(optimized)
+            except Exception as e:
+                logger.warning("HF upload failed: %s", e)
+                return None
+
+        async def _upload_ac() -> str | None:
+            try:
+                return await anglechanger_client.upload_image(optimized)
+            except Exception as e:
+                logger.warning("AC upload failed: %s", e)
+                return None
+
+        hf_path, ac_url = await asyncio.gather(_upload_hf(), _upload_ac())
+        return hf_path, ac_url
+
     async def generate_angle(
         self,
         image_data: bytes,
@@ -102,8 +129,13 @@ class ProviderManager:
         vertical_tilt: float,
         wideangle: bool,
         v_raw: float = 0.0,
+        hf_uploaded_path: str | None = None,
+        ac_uploaded_url: str | None = None,
     ) -> tuple[bytes, str, str]:
         """Generate a single angle image with automatic fallback.
+
+        If hf_uploaded_path / ac_uploaded_url are provided they are reused,
+        avoiding a re-upload per angle.
 
         Returns:
             Tuple of (image_bytes, content_type, provider_name)
@@ -115,6 +147,7 @@ class ProviderManager:
                     result = await self._generate_via_hf(
                         image_data, rotate_deg, move_forward,
                         vertical_tilt, wideangle,
+                        uploaded_path=hf_uploaded_path,
                     )
                     self._hf_breaker.record_success()
                     return result[0], result[1], "huggingface"
@@ -127,6 +160,7 @@ class ProviderManager:
                 try:
                     result = await self._generate_via_anglechanger(
                         image_data, rotate_deg, v_raw,
+                        uploaded_url=ac_uploaded_url,
                     )
                     self._ac_breaker.record_success()
                     return result[0], result[1], "anglechanger"
@@ -139,6 +173,7 @@ class ProviderManager:
                 result = await self._generate_via_hf(
                     image_data, rotate_deg, move_forward,
                     vertical_tilt, wideangle,
+                    uploaded_path=hf_uploaded_path,
                 )
                 self._hf_breaker.record_success()
                 return result[0], result[1], "huggingface"
@@ -154,15 +189,16 @@ class ProviderManager:
         move_forward: float,
         vertical_tilt: float,
         wideangle: bool,
+        uploaded_path: str | None = None,
     ) -> tuple[bytes, str]:
         """Generate via HuggingFace Gradio Space."""
-        image_hash = compute_image_hash(image_data)
-        optimized = hf_client.optimize_image(image_data)
-        uploaded_path = await hf_client.upload_image(optimized)
+        if uploaded_path is None:
+            optimized = hf_client.optimize_image(image_data)
+            uploaded_path = await hf_client.upload_image(optimized)
 
         return await hf_client.generate_angle(
             uploaded_path=uploaded_path,
-            image_hash=image_hash,
+            image_hash="",
             rotate_deg=rotate_deg,
             move_forward=move_forward,
             vertical_tilt=vertical_tilt,
@@ -174,16 +210,18 @@ class ProviderManager:
         image_data: bytes,
         rotate_deg: float,
         v_raw: float,
+        uploaded_url: str | None = None,
     ) -> tuple[bytes, str]:
         """Generate via anglechanger.ai as fallback."""
-        optimized = hf_client.optimize_image(image_data)
-        image_url = await anglechanger_client.upload_image(optimized)
+        if uploaded_url is None:
+            optimized = hf_client.optimize_image(image_data)
+            uploaded_url = await anglechanger_client.upload_image(optimized)
 
         # Convert angles for anglechanger.ai format
         h_ac, v_ac = anglechanger_client.convert_angle_for_ac(rotate_deg, v_raw)
 
         return await anglechanger_client.generate_angle(
-            image_url=image_url,
+            image_url=uploaded_url,
             horizontal_angle=h_ac,
             vertical_angle=v_ac,
             zoom=5.0,
@@ -198,6 +236,9 @@ class ProviderManager:
         forward = convert_forward(lens)
         is_wide = lens == "wide"
 
+        # Upload once and share the paths across all angle generations
+        hf_path, ac_url = await self.upload_once(image_data)
+
         tasks = []
         for angle in PREDEFINED_ANGLES:
             rotate = clamp_rotate(float(angle["h"]))
@@ -211,6 +252,8 @@ class ProviderManager:
                 vertical_tilt=tilt,
                 wideangle=is_wide,
                 v_raw=float(angle["v"]),
+                hf_uploaded_path=hf_path,
+                ac_uploaded_url=ac_url,
             )
             tasks.append(task)
 
@@ -247,6 +290,8 @@ class ProviderManager:
         vertical_tilt: float,
         wideangle: bool,
         v_raw: float,
+        hf_uploaded_path: str | None = None,
+        ac_uploaded_url: str | None = None,
     ) -> tuple[bytes, str, str]:
         """Generate a single angle with fallback. Used in generate_all_angles."""
         try:
@@ -257,6 +302,8 @@ class ProviderManager:
                 vertical_tilt=vertical_tilt,
                 wideangle=wideangle,
                 v_raw=v_raw,
+                hf_uploaded_path=hf_uploaded_path,
+                ac_uploaded_url=ac_uploaded_url,
             )
         except Exception as e:
             logger.error("All providers failed for %s: %s", angle_name, str(e))
