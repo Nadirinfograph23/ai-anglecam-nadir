@@ -225,14 +225,19 @@ class HFClient:
         seed: int,
         randomize_seed: bool,
     ) -> tuple[bytes, str]:
-        """Make the actual Gradio API call."""
+        """Make the actual Gradio API call using /infer_edit_camera_angles endpoint.
+
+        Uses the programmatic API endpoint instead of /maybe_infer to avoid
+        slider range constraints (rotation limited to -90..90 in the UI endpoint).
+        """
         client = await self._get_client()
         token = HF_API_TOKEN
 
-        # Step 1: Submit the job
+        # Use /infer_edit_camera_angles - designed for programmatic API use
+        # Parameter order: image, rotate_deg, move_forward, vertical_tilt,
+        #   wideangle, seed, randomize_seed, guidance_scale, steps, height, width, prev_output
         payload = {
             "data": [
-                False,  # is_reset_val
                 {"path": uploaded_path, "meta": {"_type": "gradio.FileData"}},
                 rotate_deg,
                 move_forward,
@@ -242,14 +247,14 @@ class HFClient:
                 randomize_seed,
                 DEFAULT_GUIDANCE_SCALE,
                 DEFAULT_INFERENCE_STEPS,
-                DEFAULT_WIDTH,
                 DEFAULT_HEIGHT,
+                DEFAULT_WIDTH,
                 None,  # prev_output
             ]
         }
 
         submit_response = await client.post(
-            f"{HF_SPACE_URL}/gradio_api/call/maybe_infer",
+            f"{HF_SPACE_URL}/gradio_api/call/infer_edit_camera_angles",
             json=payload,
             headers={
                 "Content-Type": "application/json",
@@ -258,8 +263,13 @@ class HFClient:
         )
 
         if submit_response.status_code != 200:
+            status = submit_response.status_code
+            if status in (503, 529):
+                raise RuntimeError("HF Space is loading/busy. Please retry.")
+            if status == 429:
+                raise RuntimeError("Rate limited. Please wait before retrying.")
             raise RuntimeError(
-                f"Submit failed: {submit_response.status_code} - {submit_response.text[:300]}"
+                f"Submit failed: {status} - {submit_response.text[:300]}"
             )
 
         event_id = submit_response.json().get("event_id")
@@ -268,7 +278,7 @@ class HFClient:
 
         # Step 2: Poll for result (SSE stream)
         result_response = await client.get(
-            f"{HF_SPACE_URL}/gradio_api/call/maybe_infer/{event_id}",
+            f"{HF_SPACE_URL}/gradio_api/call/infer_edit_camera_angles/{event_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -295,26 +305,46 @@ class HFClient:
         return image_response.content, content_type
 
     def _parse_sse_response(self, text: str) -> str:
-        """Parse SSE response to extract image URL."""
+        """Parse SSE response to extract image URL.
+
+        Properly handles Gradio SSE event types:
+        - heartbeat: data is null
+        - process_starts/process_generating: intermediate events
+        - process_completed/complete: final result with image URL
+        - error: error message
+        """
         lines = text.split("\n")
         error_msg = ""
+        current_event = ""
+        last_url = ""
 
         for line in lines:
-            if line.startswith("event: error"):
-                error_msg = "API returned an error"
+            if line.startswith("event: "):
+                current_event = line[7:].strip()
+                if current_event == "error":
+                    error_msg = "API returned an error"
+                continue
             if line.startswith("data: "):
                 data_str = line[6:].strip()
                 if data_str == "null":
                     continue
                 try:
                     data = json.loads(data_str)
+                    if current_event == "error" and isinstance(data, str):
+                        raise RuntimeError(data)
                     if isinstance(data, list) and len(data) > 0:
                         first = data[0]
                         if isinstance(first, dict) and "url" in first:
-                            return first["url"]
+                            url = first["url"]
+                            # Prefer URL from completed events
+                            if current_event in ("complete", "process_completed"):
+                                return url
+                            last_url = url
                 except (json.JSONDecodeError, TypeError, KeyError):
                     continue
 
+        if last_url:
+            return last_url
         raise RuntimeError(error_msg or "No result image found in SSE response")
 
     async def generate_all_angles(
