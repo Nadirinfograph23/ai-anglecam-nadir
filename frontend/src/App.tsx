@@ -66,6 +66,7 @@ function App() {
   const [progress, setProgress] = useState({ completed: 0, total: 9 });
   const [error, setError] = useState<string | null>(null);
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
+  const [retryingAll, setRetryingAll] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileSelect = useCallback((file: File) => {
@@ -94,6 +95,56 @@ function App() {
     [handleFileSelect]
   );
 
+  const processStream = async (response: Response, onResult?: (data: AngleResult) => void) => {
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("No response stream available");
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const streamResults: AngleResult[] = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const chunk of lines) {
+        const dataLine = chunk.split("\n").find((l) => l.startsWith("data: "));
+        if (!dataLine) continue;
+
+        try {
+          const data = JSON.parse(dataLine.substring(6));
+          if (data.type === "error") {
+            setError(data.message);
+          } else if (data.type === "result") {
+            const result: AngleResult = {
+              name: data.name,
+              success: data.success,
+              image_data: data.image_data,
+              content_type: data.content_type,
+              error: data.error,
+            };
+            streamResults.push(result);
+            setResults((prev) => {
+              const existing = prev.filter((r) => r.name !== data.name);
+              return [...existing, result];
+            });
+            setProgress({ completed: data.completed, total: data.total });
+            if (onResult) onResult(result);
+          } else if (data.type === "done") {
+            setProgress({ completed: data.completed, total: data.total });
+          }
+        } catch {
+          // skip
+        }
+      }
+    }
+    return streamResults;
+  };
+
   const generateAllAngles = async () => {
     if (!imageFile) return;
     setIsGenerating(true);
@@ -116,45 +167,38 @@ function App() {
         throw new Error(errData?.detail || "Server error: " + response.status);
       }
 
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response stream available");
+      const streamResults = await processStream(response);
 
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const chunk of lines) {
-          const dataLine = chunk.split("\n").find((l) => l.startsWith("data: "));
-          if (!dataLine) continue;
-
+      // Auto-retry failed angles once
+      const failedAngles = streamResults.filter((r) => !r.success);
+      if (failedAngles.length > 0 && failedAngles.length < 9) {
+        for (const failed of failedAngles) {
           try {
-            const data = JSON.parse(dataLine.substring(6));
-            if (data.type === "error") {
-              setError(data.message);
-            } else if (data.type === "result") {
-              setResults((prev) => {
-                const existing = prev.filter((r) => r.name !== data.name);
-                return [...existing, {
-                  name: data.name,
-                  success: data.success,
-                  image_data: data.image_data,
-                  content_type: data.content_type,
-                  error: data.error,
-                }];
-              });
-              setProgress({ completed: data.completed, total: data.total });
-            } else if (data.type === "done") {
-              setProgress({ completed: data.completed, total: data.total });
+            const retryFormData = new FormData();
+            retryFormData.append("image", imageFile);
+            retryFormData.append("angle_name", failed.name);
+            retryFormData.append("lens", lens);
+
+            const retryResponse = await fetch(API_URL + "/api/retry-angle", {
+              method: "POST",
+              body: retryFormData,
+            });
+            if (retryResponse.ok) {
+              const data = await retryResponse.json();
+              if (data.success) {
+                setResults((prev) => {
+                  const existing = prev.filter((r) => r.name !== data.name);
+                  return [...existing, {
+                    name: data.name,
+                    success: data.success,
+                    image_data: data.image_data,
+                    content_type: data.content_type,
+                  }];
+                });
+              }
             }
           } catch {
-            // skip
+            // silent retry failure
           }
         }
       }
@@ -201,6 +245,43 @@ function App() {
     }
   };
 
+  const retryAllFailed = async () => {
+    if (!imageFile) return;
+    const failedResults = results.filter((r) => !r.success);
+    if (failedResults.length === 0) return;
+    setRetryingAll(true);
+    setError(null);
+
+    for (const failed of failedResults) {
+      try {
+        const formData = new FormData();
+        formData.append("image", imageFile);
+        formData.append("angle_name", failed.name);
+        formData.append("lens", lens);
+
+        const response = await fetch(API_URL + "/api/retry-angle", {
+          method: "POST",
+          body: formData,
+        });
+        if (response.ok) {
+          const data = await response.json();
+          setResults((prev) => {
+            const existing = prev.filter((r) => r.name !== data.name);
+            return [...existing, {
+              name: data.name,
+              success: data.success,
+              image_data: data.image_data,
+              content_type: data.content_type,
+            }];
+          });
+        }
+      } catch {
+        // continue with next angle
+      }
+    }
+    setRetryingAll(false);
+  };
+
   const downloadImage = (result: AngleResult) => {
     if (!result.image_data || !result.content_type) return;
     const ext = result.content_type.includes("webp") ? "webp" : "png";
@@ -228,9 +309,10 @@ function App() {
         return { name, success: false as const, pending: true as const };
       });
     }
+    // Only show successful results - hide failed ones
     return ANGLE_NAMES
       .map((name) => results.find((r) => r.name === name))
-      .filter((r): r is AngleResult => r !== undefined);
+      .filter((r): r is AngleResult => r !== undefined && r.success);
   };
 
   return (
@@ -369,27 +451,53 @@ function App() {
             )}
 
             {results.length > 0 && !isGenerating && (
-              <div className="rounded-xl bg-gray-800/50 p-3 flex items-center justify-between text-sm">
-                <div className="flex items-center gap-4">
-                  <span className="flex items-center gap-1 text-green-400">
-                    <CheckCircle2 className="h-4 w-4" />
-                    {successCount + " succeeded"}
-                  </span>
-                  {failCount > 0 && (
-                    <span className="flex items-center gap-1 text-red-400">
-                      <AlertCircle className="h-4 w-4" />
-                      {failCount + " failed"}
+              <div className="space-y-2">
+                <div className="rounded-xl bg-gray-800/50 p-3 flex items-center justify-between text-sm">
+                  <div className="flex items-center gap-4">
+                    <span className="flex items-center gap-1 text-green-400">
+                      <CheckCircle2 className="h-4 w-4" />
+                      {successCount + " succeeded"}
                     </span>
-                  )}
+                    {failCount > 0 && (
+                      <span className="flex items-center gap-1 text-red-400">
+                        <AlertCircle className="h-4 w-4" />
+                        {failCount + " failed"}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {failCount > 0 && (
+                      <button
+                        onClick={retryAllFailed}
+                        disabled={retryingAll}
+                        className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-orange-600/80 text-white hover:bg-orange-500 transition-colors disabled:opacity-50"
+                      >
+                        {retryingAll ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RotateCcw className="h-3.5 w-3.5" />
+                        )}
+                        Retry Failed
+                      </button>
+                    )}
+                    {successCount > 0 && (
+                      <button
+                        onClick={downloadAll}
+                        className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-gradient-to-r from-blue-600 to-cyan-600 text-white hover:from-blue-500 hover:to-cyan-500 transition-colors"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        Download All
+                      </button>
+                    )}
+                  </div>
                 </div>
-                {successCount > 0 && (
-                  <button
-                    onClick={downloadAll}
-                    className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-gradient-to-r from-blue-600 to-cyan-600 text-white hover:from-blue-500 hover:to-cyan-500 transition-colors"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    Download All
-                  </button>
+                {failCount > 0 && (
+                  <div className="rounded-xl bg-amber-900/30 border border-amber-700/40 p-3 flex items-start gap-2">
+                    <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
+                    <p className="text-amber-300 text-sm">
+                      {"تم توليد " + successCount + " صور من أصل " + (successCount + failCount) + " بسبب الضغط على الخادم. عاود المحاولة بعد قليل."}
+                    </p>
+                  </div>
                 )}
               </div>
             )}
