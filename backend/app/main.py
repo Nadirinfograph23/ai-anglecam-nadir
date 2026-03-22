@@ -186,15 +186,17 @@ async def generate_stream(
 
         yield f"data: {json.dumps({'type': 'start', 'total': total, 'providers': providers})}\n\n"
 
+        last_completed = 0
         try:
             async for item in provider_manager.generate_all_angles_stream(image_data, lens=lens):
                 yield f"data: {json.dumps(item)}\n\n"
+                if item.get("completed"):
+                    last_completed = item["completed"]
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             return
 
-        completed = total
-        yield f"data: {json.dumps({'type': 'done', 'completed': completed, 'total': total})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'completed': last_completed, 'total': total})}\n\n"
 
     return StreamingResponse(
         event_stream(),

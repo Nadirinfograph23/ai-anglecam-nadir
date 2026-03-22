@@ -435,17 +435,17 @@ class HFClient:
         forward = convert_forward(lens)
         tilt = convert_vertical(float(v_angle))
 
-        async with self._semaphore:
-            return await self._generate_with_retry(
-                uploaded_path=uploaded_path,
-                image_hash=image_hash,
-                rotate_deg=rotate,
-                move_forward=forward,
-                vertical_tilt=tilt,
-                wideangle=(lens == "wide"),
-                seed=0,
-                randomize_seed=True,
-            )
+        # No semaphore here — the provider_manager already controls concurrency
+        return await self._generate_with_retry(
+            uploaded_path=uploaded_path,
+            image_hash=image_hash,
+            rotate_deg=rotate,
+            move_forward=forward,
+            vertical_tilt=tilt,
+            wideangle=(lens == "wide"),
+            seed=0,
+            randomize_seed=True,
+        )
 
     def optimize_image(self, image_data: bytes, max_size: int = 2048) -> bytes:
         """Optimize image for upload - resize if too large, convert to PNG."""
