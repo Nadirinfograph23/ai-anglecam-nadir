@@ -101,6 +101,14 @@ class HFClient:
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
         self._http_client: httpx.AsyncClient | None = None
 
+    @property
+    def name(self) -> str:
+        return "HuggingFace Space"
+
+    @property
+    def is_available(self) -> bool:
+        return True  # HF Space can work without token for public spaces
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(
@@ -406,6 +414,38 @@ class HFClient:
             if progress_queue:
                 await progress_queue.put({"name": angle_name, "status": "failed", "error": str(e)})
             raise
+
+    async def generate_angle_direct(
+        self,
+        image_data: bytes,
+        h_angle: float,
+        v_angle: float,
+        lens: str = "normal",
+    ) -> tuple[bytes, str]:
+        """Generate a single angle from raw image data (no pre-upload needed).
+
+        This method handles upload + generation in one call,
+        used by the provider manager.
+        """
+        optimized = self.optimize_image(image_data)
+        image_hash = compute_image_hash(image_data)
+        uploaded_path = await self.upload_image(optimized)
+
+        rotate = clamp_rotate(float(h_angle))
+        forward = convert_forward(lens)
+        tilt = convert_vertical(float(v_angle))
+
+        async with self._semaphore:
+            return await self._generate_with_retry(
+                uploaded_path=uploaded_path,
+                image_hash=image_hash,
+                rotate_deg=rotate,
+                move_forward=forward,
+                vertical_tilt=tilt,
+                wideangle=(lens == "wide"),
+                seed=0,
+                randomize_seed=True,
+            )
 
     def optimize_image(self, image_data: bytes, max_size: int = 2048) -> bytes:
         """Optimize image for upload - resize if too large, convert to PNG."""

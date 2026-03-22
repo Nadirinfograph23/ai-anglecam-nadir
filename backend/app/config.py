@@ -7,8 +7,17 @@ from dotenv import load_dotenv
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path)
 
+# --- Provider API Keys ---
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://linoyts-qwen-image-edit-angles.hf.space")
+
+FAL_API_KEY = os.getenv("FAL_API_KEY", "")
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
+STABLE_HORDE_API_KEY = os.getenv("STABLE_HORDE_API_KEY", "0000000000")  # anon key works
+
+# Provider priority order (comma-separated). First available provider is tried first.
+# Options: fal, hf, replicate, stablehorde
+PROVIDER_ORDER = os.getenv("PROVIDER_ORDER", "fal,hf,replicate,stablehorde")
 
 # Generation defaults
 DEFAULT_GUIDANCE_SCALE = 1.0
@@ -20,6 +29,9 @@ DEFAULT_HEIGHT = 1024
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0  # seconds
 RETRY_MAX_DELAY = 30.0  # seconds
+
+# Per-angle timeout (seconds) - prevents hanging indefinitely
+ANGLE_TIMEOUT = 120
 
 # Concurrency control - how many parallel generations at once
 MAX_CONCURRENT_GENERATIONS = 3
