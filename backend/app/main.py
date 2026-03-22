@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from app.config import (
     MAX_UPLOAD_SIZE_MB,
     PREDEFINED_ANGLES,
+    STAGGER_DELAY,
 )
 from app.services.hf_client import (
     clamp_rotate,
@@ -188,9 +189,11 @@ async def generate_stream(
 
         yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
 
-        # Create all tasks with angle name tracking
+        # Create tasks with staggered launches to reduce API pressure
         pending_tasks = {}
-        for angle in PREDEFINED_ANGLES:
+        for i, angle in enumerate(PREDEFINED_ANGLES):
+            if i > 0:
+                await asyncio.sleep(STAGGER_DELAY)
             rotate = clamp_rotate(float(angle["h"]))
             tilt = convert_vertical(float(angle["v"]))
             task = asyncio.create_task(
@@ -204,6 +207,18 @@ async def generate_stream(
                 )
             )
             pending_tasks[task] = angle["name"]
+
+            # Yield any results that completed while we were staggering
+            done_early = [t for t in pending_tasks if t.done()]
+            for task_done in done_early:
+                angle_name = pending_tasks.pop(task_done)
+                completed += 1
+                try:
+                    img_bytes, content_type = task_done.result()
+                    b64 = base64.b64encode(img_bytes).decode("utf-8")
+                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': True, 'image_data': b64, 'content_type': content_type, 'completed': completed, 'total': total})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'result', 'name': angle_name, 'success': False, 'error': str(e), 'completed': completed, 'total': total})}\n\n"
 
         # Yield results as they complete
         while pending_tasks:
