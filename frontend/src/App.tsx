@@ -46,8 +46,37 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-// ===== HuggingFace Gradio Space Configuration =====
+// ===== Provider Types =====
+type ProviderName = "puter" | "huggingface";
+
+interface ProviderStatus {
+  name: ProviderName;
+  label: string;
+  available: boolean;
+  failCount: number;
+}
+
+// ===== Constants =====
 const HF_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
+
+const PUTER_MODELS_FALLBACK = [
+  { model: "dall-e-3", provider: "openai-image-generation" },
+  { model: "gpt-image-1-mini", provider: "openai-image-generation" },
+  { model: "flux-1-schnell", provider: "together" },
+  { model: "grok-2-image", provider: "xai" },
+];
+
+const ANGLE_PROMPTS: Record<string, string> = {
+  "Front": "viewed from the front, facing the camera directly, centered frontal view",
+  "Front Right": "viewed from the front-right at a 45-degree angle, three-quarter view from the right",
+  "Right": "viewed from the right side, 90-degree side profile view from the right",
+  "Back Right": "viewed from the back-right at a 135-degree angle, three-quarter rear view from the right",
+  "Back": "viewed from behind, rear view showing the back, 180-degree turn",
+  "Back Left": "viewed from the back-left at a 135-degree angle, three-quarter rear view from the left",
+  "Left": "viewed from the left side, 90-degree side profile view from the left",
+  "Front Left": "viewed from the front-left at a 45-degree angle, three-quarter view from the left",
+  "Top View": "viewed from above, bird's-eye view looking down at a 60-degree angle, top-down perspective",
+};
 
 const PREDEFINED_ANGLES = [
   { name: "Front", h: 0, v: 0 },
@@ -115,6 +144,92 @@ async function optimizeImage(file: File, maxSize = 2048): Promise<Blob> {
     };
     img.src = objectUrl;
   });
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function imgElementToBase64(imgEl: HTMLImageElement): { imageData: string; contentType: string } {
+  const canvas = document.createElement("canvas");
+  canvas.width = imgEl.naturalWidth || imgEl.width || 1024;
+  canvas.height = imgEl.naturalHeight || imgEl.height || 1024;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas context unavailable");
+  ctx.drawImage(imgEl, 0, 0);
+  const dataUrl = canvas.toDataURL("image/png");
+  const base64 = dataUrl.split(",")[1] || "";
+  return { imageData: base64, contentType: "image/png" };
+}
+
+// ===== Puter.js Provider =====
+function isPuterAvailable(): boolean {
+  return typeof puter !== "undefined" && puter?.ai !== undefined;
+}
+
+async function analyzeImageWithPuter(imageDataUrl: string): Promise<string> {
+  if (!isPuterAvailable()) throw new Error("Puter.js not available");
+
+  const description = await puter.ai.chat(
+    "Describe this image in detail for image generation. Focus on: the main subject, its shape, colors, materials, textures, lighting, background, and overall composition. Be specific and concise. Output ONLY the description, nothing else.",
+    imageDataUrl,
+    { model: "qwen/qwen2.5-vl-72b-instruct" }
+  );
+
+  if (!description || description.length < 10) {
+    throw new Error("Failed to get image description from Puter.js");
+  }
+
+  return description;
+}
+
+async function generateWithPuter(
+  description: string,
+  angleName: string,
+): Promise<{ imageData: string; contentType: string }> {
+  if (!isPuterAvailable()) throw new Error("Puter.js not available");
+
+  const anglePrompt = ANGLE_PROMPTS[angleName] || "viewed from a different angle";
+  const fullPrompt = description + ", " + anglePrompt + ", photorealistic, high quality, detailed, same subject and style as original";
+
+  let lastError: Error | null = null;
+
+  for (const modelConfig of PUTER_MODELS_FALLBACK) {
+    try {
+      const imgElement = await puter.ai.txt2img({
+        prompt: fullPrompt,
+        model: modelConfig.model,
+        provider: modelConfig.provider,
+      });
+
+      if (imgElement instanceof HTMLImageElement) {
+        await new Promise<void>((resolve, reject) => {
+          if (imgElement.complete && imgElement.naturalWidth > 0) {
+            resolve();
+            return;
+          }
+          imgElement.onload = () => resolve();
+          imgElement.onerror = () => reject(new Error("Image failed to load"));
+          setTimeout(() => reject(new Error("Image load timeout")), 30000);
+        });
+
+        return imgElementToBase64(imgElement);
+      }
+
+      throw new Error("Unexpected response from Puter.js txt2img");
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      console.warn("[Puter] Model " + modelConfig.model + " failed:", lastError.message);
+      continue;
+    }
+  }
+
+  throw lastError || new Error("All Puter.js models failed");
 }
 
 // ===== HuggingFace Gradio API Client =====
@@ -272,7 +387,7 @@ async function withRetry<T>(
       return await fn();
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn("[HF] " + label + " attempt " + (attempt + 1) + "/" + maxRetries + " failed:", lastError.message);
+      console.warn("[Retry] " + label + " attempt " + (attempt + 1) + "/" + maxRetries + " failed:", lastError.message);
       if (attempt < maxRetries - 1) {
         const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
         await new Promise((r) => setTimeout(r, delay));
@@ -282,6 +397,63 @@ async function withRetry<T>(
   throw lastError || new Error(label + " failed after " + maxRetries + " attempts");
 }
 
+// ===== Multi-Provider Generation Engine =====
+async function generateAngleWithFallback(
+  angleName: string,
+  imageDescription: string | null,
+  lens: string,
+  hfUploadedPath: string | null,
+  providers: ProviderStatus[],
+  onProviderFail: (name: ProviderName) => void,
+): Promise<{ imageData: string; contentType: string; usedProvider: ProviderName }> {
+
+  const sortedProviders = [...providers]
+    .filter((p) => p.available)
+    .sort((a, b) => a.failCount - b.failCount);
+
+  for (const provider of sortedProviders) {
+    try {
+      if (provider.name === "puter") {
+        if (!isPuterAvailable() || !imageDescription) {
+          onProviderFail("puter");
+          continue;
+        }
+        const result = await withRetry(
+          () => generateWithPuter(imageDescription, angleName),
+          2, 2000, "Puter/" + angleName
+        );
+        return { ...result, usedProvider: "puter" };
+      }
+
+      if (provider.name === "huggingface") {
+        if (!hfUploadedPath) {
+          onProviderFail("huggingface");
+          continue;
+        }
+        const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
+        if (!angle) throw new Error("Unknown angle: " + angleName);
+
+        const rotate = clampRotate(angle.h);
+        const forward = convertForward(lens);
+        const tilt = convertVertical(angle.v);
+        const isWide = lens === "wide";
+
+        const result = await withRetry(
+          () => generateSingleAngleFromHF(hfUploadedPath, rotate, forward, tilt, isWide),
+          3, 3000, "HF/" + angleName
+        );
+        return { ...result, usedProvider: "huggingface" };
+      }
+    } catch (e) {
+      console.warn("[Fallback] Provider " + provider.name + " failed for " + angleName + ":", e instanceof Error ? e.message : String(e));
+      onProviderFail(provider.name);
+      continue;
+    }
+  }
+
+  throw new Error("All providers failed for angle: " + angleName);
+}
+
 // ===== React Types and Constants =====
 interface AngleResult {
   name: string;
@@ -289,6 +461,7 @@ interface AngleResult {
   image_data?: string;
   content_type?: string;
   error?: string;
+  provider?: ProviderName;
 }
 
 interface PendingAngle {
@@ -314,6 +487,18 @@ function isPending(item: GridItem): item is PendingAngle {
   return "pending" in item && item.pending === true;
 }
 
+function getProviderBadgeColor(provider?: ProviderName): string {
+  if (provider === "puter") return "bg-green-600/80";
+  if (provider === "huggingface") return "bg-yellow-600/80";
+  return "bg-gray-600/80";
+}
+
+function getProviderLabel(provider?: ProviderName): string {
+  if (provider === "puter") return "Puter.js";
+  if (provider === "huggingface") return "HuggingFace";
+  return "";
+}
+
 function App() {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -325,8 +510,24 @@ function App() {
   const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
   const [imageCount, setImageCount] = useState<number | null>(null);
+  const [activeProvider, setActiveProvider] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const uploadedPathRef = useRef<string | null>(null);
+  const hfUploadedPathRef = useRef<string | null>(null);
+  const imageDescriptionRef = useRef<string | null>(null);
+  const imageDataUrlRef = useRef<string | null>(null);
+
+  const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([
+    { name: "puter", label: "Puter.js", available: true, failCount: 0 },
+    { name: "huggingface", label: "HuggingFace", available: true, failCount: 0 },
+  ]);
+
+  const handleProviderFail = useCallback((name: ProviderName) => {
+    setProviderStatuses((prev) =>
+      prev.map((p) =>
+        p.name === name ? { ...p, failCount: p.failCount + 1 } : p
+      )
+    );
+  }, []);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -340,9 +541,15 @@ function App() {
     setImageFile(file);
     setError(null);
     setResults([]);
-    uploadedPathRef.current = null;
+    hfUploadedPathRef.current = null;
+    imageDescriptionRef.current = null;
+    imageDataUrlRef.current = null;
     const reader = new FileReader();
-    reader.onload = (e) => setSelectedImage(e.target?.result as string);
+    reader.onload = (e) => {
+      const dataUrl = e.target?.result as string;
+      setSelectedImage(dataUrl);
+      imageDataUrlRef.current = dataUrl;
+    };
     reader.readAsDataURL(file);
   }, []);
 
@@ -365,32 +572,81 @@ function App() {
     const total = imageCount;
     setProgress({ completed: 0, total });
 
-    try {
-      const optimized = await optimizeImage(imageFile);
-      const uploadedPath = await withRetry(
-        () => uploadToHF(optimized),
-        3, 3000, "Upload"
-      );
-      uploadedPathRef.current = uploadedPath;
+    // Reset provider fail counts
+    setProviderStatuses((prev) =>
+      prev.map((p) => ({ ...p, failCount: 0 }))
+    );
 
-      const forward = convertForward(lens);
-      const isWide = lens === "wide";
+    try {
+      // Phase 1: Prepare providers in parallel
+      setActiveProvider("Preparing providers...");
+
+      const imageDataUrl = imageDataUrlRef.current || await fileToDataUrl(imageFile);
+      imageDataUrlRef.current = imageDataUrl;
+
+      const [puterReady, hfReady] = await Promise.allSettled([
+        // Puter.js: Analyze image to get description
+        (async () => {
+          if (!isPuterAvailable()) throw new Error("Puter.js not loaded");
+          setActiveProvider("Analyzing image with AI...");
+          const description = await analyzeImageWithPuter(imageDataUrl);
+          imageDescriptionRef.current = description;
+          console.log("[Puter] Image description:", description.substring(0, 100) + "...");
+          return true;
+        })(),
+        // HuggingFace: Upload image
+        (async () => {
+          const optimized = await optimizeImage(imageFile);
+          const uploadedPath = await withRetry(
+            () => uploadToHF(optimized),
+            3, 3000, "HF Upload"
+          );
+          hfUploadedPathRef.current = uploadedPath;
+          return true;
+        })(),
+      ]);
+
+      const puterAvailable = puterReady.status === "fulfilled";
+      const hfAvailable = hfReady.status === "fulfilled";
+
+      if (!puterAvailable && !hfAvailable) {
+        throw new Error("All providers failed to initialize. Please try again.");
+      }
+
+      // Update provider availability
+      setProviderStatuses((prev) =>
+        prev.map((p) => {
+          if (p.name === "puter") return { ...p, available: puterAvailable };
+          if (p.name === "huggingface") return { ...p, available: hfAvailable };
+          return p;
+        })
+      );
+
+      if (puterAvailable) {
+        setActiveProvider("Puter.js (primary)");
+      } else {
+        setActiveProvider("HuggingFace (fallback)");
+      }
+
+      // Phase 2: Generate images
       let completedCount = 0;
       const anglesToGenerate = PREDEFINED_ANGLES.slice(0, total);
-
       const batchSize = 2;
+
       for (let i = 0; i < anglesToGenerate.length; i += batchSize) {
         const batch = anglesToGenerate.slice(i, i + batchSize);
 
         const batchPromises = batch.map(async (angle) => {
-          const rotate = clampRotate(angle.h);
-          const tilt = convertVertical(angle.v);
-
           try {
-            const result = await withRetry(
-              () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-              4, 3000, angle.name
+            const result = await generateAngleWithFallback(
+              angle.name,
+              imageDescriptionRef.current,
+              lens,
+              hfUploadedPathRef.current,
+              providerStatuses,
+              handleProviderFail,
             );
+
             completedCount++;
             setProgress({ completed: completedCount, total });
             setResults((prev) => [
@@ -400,6 +656,7 @@ function App() {
                 success: true,
                 image_data: result.imageData,
                 content_type: result.contentType,
+                provider: result.usedProvider,
               },
             ]);
           } catch (e) {
@@ -426,6 +683,7 @@ function App() {
       setError(e instanceof Error ? e.message : "Generation failed. Please try again.");
     } finally {
       setIsGenerating(false);
+      setActiveProvider("");
     }
   };
 
@@ -435,24 +693,32 @@ function App() {
     setError(null);
 
     try {
-      const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
-      if (!angle) throw new Error("Unknown angle: " + angleName);
+      const imageDataUrl = imageDataUrlRef.current || await fileToDataUrl(imageFile);
 
-      let uploadedPath = uploadedPathRef.current;
-      if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
-        uploadedPathRef.current = uploadedPath;
+      if (isPuterAvailable() && !imageDescriptionRef.current) {
+        try {
+          imageDescriptionRef.current = await analyzeImageWithPuter(imageDataUrl);
+        } catch {
+          // Continue without puter
+        }
       }
 
-      const rotate = clampRotate(angle.h);
-      const forward = convertForward(lens);
-      const tilt = convertVertical(angle.v);
-      const isWide = lens === "wide";
+      if (!hfUploadedPathRef.current) {
+        try {
+          const optimized = await optimizeImage(imageFile);
+          hfUploadedPathRef.current = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+        } catch {
+          // Continue without HF
+        }
+      }
 
-      const result = await withRetry(
-        () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-        4, 2000, angleName
+      const result = await generateAngleWithFallback(
+        angleName,
+        imageDescriptionRef.current,
+        lens,
+        hfUploadedPathRef.current,
+        providerStatuses,
+        handleProviderFail,
       );
 
       setResults((prev) => [
@@ -462,6 +728,7 @@ function App() {
           success: true,
           image_data: result.imageData,
           content_type: result.contentType,
+          provider: result.usedProvider,
         },
       ]);
     } catch (e) {
@@ -479,27 +746,34 @@ function App() {
     setError(null);
 
     try {
-      let uploadedPath = uploadedPathRef.current;
-      if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
-        uploadedPathRef.current = uploadedPath;
+      const imageDataUrl = imageDataUrlRef.current || await fileToDataUrl(imageFile);
+
+      if (isPuterAvailable() && !imageDescriptionRef.current) {
+        try {
+          imageDescriptionRef.current = await analyzeImageWithPuter(imageDataUrl);
+        } catch {
+          // Continue
+        }
       }
 
-      const forward = convertForward(lens);
-      const isWide = lens === "wide";
+      if (!hfUploadedPathRef.current) {
+        try {
+          const optimized = await optimizeImage(imageFile);
+          hfUploadedPathRef.current = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
+        } catch {
+          // Continue
+        }
+      }
 
       for (const failed of failedResults) {
-        const angle = PREDEFINED_ANGLES.find((a) => a.name === failed.name);
-        if (!angle) continue;
-
         try {
-          const rotate = clampRotate(angle.h);
-          const tilt = convertVertical(angle.v);
-
-          const result = await withRetry(
-            () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-            3, 4000, failed.name
+          const result = await generateAngleWithFallback(
+            failed.name,
+            imageDescriptionRef.current,
+            lens,
+            hfUploadedPathRef.current,
+            providerStatuses,
+            handleProviderFail,
           );
 
           setResults((prev) => [
@@ -509,6 +783,7 @@ function App() {
               success: true,
               image_data: result.imageData,
               content_type: result.contentType,
+              provider: result.usedProvider,
             },
           ]);
         } catch {
@@ -577,7 +852,7 @@ function App() {
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Sparkles className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Powered by Qwen Image Edit</span>
+              <span className="hidden sm:inline">Powered by Puter.js + HuggingFace</span>
             </div>
           </div>
         </div>
@@ -587,8 +862,36 @@ function App() {
         <div className="mb-6">
           <h2 className="text-2xl font-bold text-white">Generate Multi-Angle Views</h2>
           <p className="text-gray-400 text-sm mt-1">
-            Upload an image and generate 9 different viewing angles automatically
+            Upload an image and generate different viewing angles automatically
           </p>
+        </div>
+
+        {/* Provider Status Bar */}
+        <div className="mb-4 flex flex-wrap gap-2">
+          {providerStatuses.map((p) => (
+            <div
+              key={p.name}
+              className={"flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium " + (
+                p.available && p.failCount === 0
+                  ? "bg-green-900/40 text-green-400 border border-green-800/50"
+                  : p.available && p.failCount > 0
+                  ? "bg-yellow-900/40 text-yellow-400 border border-yellow-800/50"
+                  : "bg-red-900/40 text-red-400 border border-red-800/50"
+              )}
+            >
+              <span className={"inline-block w-1.5 h-1.5 rounded-full " + (
+                p.available && p.failCount === 0 ? "bg-green-400" : p.available ? "bg-yellow-400" : "bg-red-400"
+              )} />
+              {p.label}
+              {p.failCount > 0 && <span className="opacity-70">({p.failCount} fails)</span>}
+            </div>
+          ))}
+          {activeProvider && (
+            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-blue-900/40 text-blue-400 border border-blue-800/50">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {activeProvider}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -765,7 +1068,7 @@ function App() {
                   <div className="rounded-xl bg-amber-900/30 border border-amber-700/40 p-3 flex items-start gap-2">
                     <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
                     <p className="text-amber-300 text-sm">
-                      {"Some angles failed due to server load. Click 'Retry Failed' to try again."}
+                      {"Some angles failed. Click 'Retry Failed' to try again with automatic provider fallback."}
                     </p>
                   </div>
                 )}
@@ -794,7 +1097,7 @@ function App() {
                       {item.success && "image_data" in item && item.image_data ? (
                         <>
                           <img
-                            src={"data:" + (item.content_type || "image/webp") + ";base64," + item.image_data}
+                            src={"data:" + (item.content_type || "image/png") + ";base64," + item.image_data}
                             alt={item.name}
                             className="w-full h-auto aspect-square object-cover"
                           />
@@ -806,25 +1109,35 @@ function App() {
                               <Download className="h-5 w-5 text-white" />
                             </button>
                           </div>
-                        </>
-                        ) : !isPending(item) && item.error ? (
-                          <div className="w-full aspect-square flex items-center justify-center bg-gray-800">
-                            <button
-                              onClick={() => retryAngle(item.name)}
-                              disabled={retryingAngle === item.name}
-                              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-red-600/80 text-white hover:bg-red-500 transition-colors disabled:opacity-50"
-                            >
-                              {retryingAngle === item.name ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                <RotateCcw className="h-4 w-4" />
-                              )}
-                              Retry
-                            </button>
+                          {"provider" in item && item.provider && (
+                            <div className={"absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[10px] font-medium text-white " + getProviderBadgeColor(item.provider)}>
+                              {getProviderLabel(item.provider)}
+                            </div>
+                          )}
+                          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent px-2 py-1.5">
+                            <p className="text-white text-xs font-medium">{item.name}</p>
                           </div>
+                        </>
+                      ) : !isPending(item) && item.error ? (
+                        <div className="w-full aspect-square flex flex-col items-center justify-center bg-gray-800 gap-2 p-3">
+                          <p className="text-gray-400 text-xs text-center">{item.name}</p>
+                          <button
+                            onClick={() => retryAngle(item.name)}
+                            disabled={retryingAngle === item.name}
+                            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-red-600/80 text-white hover:bg-red-500 transition-colors disabled:opacity-50"
+                          >
+                            {retryingAngle === item.name ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <RotateCcw className="h-4 w-4" />
+                            )}
+                            Retry
+                          </button>
+                        </div>
                       ) : (
-                        <div className="w-full aspect-square flex items-center justify-center">
+                        <div className="w-full aspect-square flex flex-col items-center justify-center gap-2">
                           <Loader2 className="h-6 w-6 animate-spin text-gray-500" />
+                          <p className="text-gray-500 text-xs">{item.name}</p>
                         </div>
                       )}
                     </div>
