@@ -609,7 +609,9 @@ function App() {
 
   const downloadImage = () => {
     if (!resultImage) return;
-    const ext = resultImage.contentType.includes("webp") ? "webp" : "png";
+    let ext = "png";
+    if (resultImage.contentType.includes("webp")) ext = "webp";
+    else if (resultImage.contentType.includes("jpeg") || resultImage.contentType.includes("jpg")) ext = "jpg";
     const link = document.createElement("a");
     link.href = "data:" + resultImage.contentType + ";base64," + resultImage.imageData;
     link.download = "angle-" + selectedAngle.name.toLowerCase().replace(/\s+/g, "-") + "." + ext;
@@ -789,11 +791,12 @@ function App() {
               </div>
 
               {resultImage ? (
-                <div className="rounded-xl overflow-hidden bg-gray-800 group relative">
+                <div className="rounded-xl overflow-hidden bg-black group relative flex items-center justify-center">
                   <img
                     src={"data:" + resultImage.contentType + ";base64," + resultImage.imageData}
                     alt={"Generated " + selectedAngle.name + " view"}
                     className="w-full h-auto max-h-[600px] object-contain"
+                    onError={() => setError("Failed to display the generated image. Please try again.")}
                   />
                   <div className="absolute bottom-3 left-3 bg-black/80 backdrop-blur-sm rounded-lg px-3 py-1.5 text-xs text-[#CDFF00] font-medium">
                     {selectedAngle.name + " (" + selectedAngle.h + "\u00B0, " + selectedAngle.v + "\u00B0)"}
