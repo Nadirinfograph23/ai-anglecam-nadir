@@ -3,7 +3,8 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 // ===== Configuration =====
 const HF_SPACE_URLS = [
   "https://linoyts-qwen-image-edit-angles.hf.space",
-  "https://linoyts-qwen2-5-image-edit.hf.space",
+  "https://linoyts-qwen-image-edit-2511-anypose.hf.space",
+  "https://qwen-qwen-image-edit-2511.hf.space",
 ];
 
 const REPLICATE_API_URL = "https://api.replicate.com/v1/predictions";
@@ -16,8 +17,8 @@ const GENERATION_DEFAULTS = {
   height: 1024,
 };
 
-const PROVIDER_TIMEOUT = 120_000; // 120s per provider
-const UPLOAD_TIMEOUT = 60_000;
+const PROVIDER_TIMEOUT = 60_000; // 60s per provider (fits within Vercel function limits)
+const UPLOAD_TIMEOUT = 30_000;
 
 // ===== Simple in-memory cache (per cold-start) =====
 const cache = new Map<string, { data: string; contentType: string; ts: number }>();
@@ -154,6 +155,24 @@ function parseSSEForImageUrl(text: string): string {
   throw new Error(errorMsg || "No image URL found in API response");
 }
 
+// Detect the correct Gradio inference endpoint for a given space
+async function detectInferEndpoint(spaceUrl: string): Promise<string> {
+  try {
+    const resp = await fetch(`${spaceUrl}/gradio_api/info`, {
+      signal: timeoutSignal(10_000),
+    });
+    if (!resp.ok) return "/gradio_api/call/maybe_infer";
+    const info = (await resp.json()) as { named_endpoints?: Record<string, unknown> };
+    const endpoints = Object.keys(info.named_endpoints || {});
+    if (endpoints.includes("/maybe_infer")) return "/gradio_api/call/maybe_infer";
+    if (endpoints.includes("/infer")) return "/gradio_api/call/infer";
+    if (endpoints.includes("/infer_edit_camera_angles")) return "/gradio_api/call/infer_edit_camera_angles";
+    return "/gradio_api/call/maybe_infer";
+  } catch {
+    return "/gradio_api/call/maybe_infer";
+  }
+}
+
 async function tryHFSpace(
   imageBuffer: Buffer,
   rotateDeg: number,
@@ -164,6 +183,18 @@ async function tryHFSpace(
   for (const spaceUrl of HF_SPACE_URLS) {
     try {
       console.log(`[HF Space] Trying ${spaceUrl}...`);
+
+      // Quick health check — skip dead spaces immediately
+      const healthResp = await fetch(`${spaceUrl}/gradio_api/info`, {
+        signal: timeoutSignal(10_000),
+      }).catch(() => null);
+      if (!healthResp || !healthResp.ok) {
+        console.warn(`[HF Space] ${spaceUrl} is not reachable (status: ${healthResp?.status ?? "network error"}), skipping`);
+        continue;
+      }
+
+      const inferEndpoint = await detectInferEndpoint(spaceUrl);
+      console.log(`[HF Space] Using endpoint ${inferEndpoint} for ${spaceUrl}`);
 
       const uploadedPath = await uploadToHFSpace(imageBuffer, spaceUrl);
 
@@ -193,7 +224,7 @@ async function tryHFSpace(
       };
 
       const submitResponse = await fetch(
-        `${spaceUrl}/gradio_api/call/maybe_infer`,
+        `${spaceUrl}${inferEndpoint}`,
         {
           method: "POST",
           headers,
@@ -221,7 +252,7 @@ async function tryHFSpace(
       }
 
       const resultResponse = await fetch(
-        `${spaceUrl}/gradio_api/call/maybe_infer/${eventId}`,
+        `${spaceUrl}${inferEndpoint}/${eventId}`,
         {
           headers: resultHeaders,
           signal: timeoutSignal(PROVIDER_TIMEOUT),
