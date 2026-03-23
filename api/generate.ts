@@ -492,7 +492,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // Try providers in order
+    // Run all providers in parallel with Promise.any for speed optimization.
+    // The first provider to succeed wins; if all fail, return error.
     const providers: Array<{
       name: string;
       fn: () => Promise<{ imageData: string; contentType: string } | null>;
@@ -515,35 +516,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     ];
 
-    for (const provider of providers) {
-      try {
+    // Wrap each provider so null results become rejections for Promise.any
+    const providerPromises = providers.map((provider) =>
+      (async () => {
         console.log(`[Provider] Trying ${provider.name}...`);
         const result = await provider.fn();
-        if (result) {
-          // Cache successful result
-          cache.set(cacheKey, { ...result, ts: Date.now() });
-          // Limit cache size
-          if (cache.size > 100) {
-            const firstKey = cache.keys().next().value;
-            if (firstKey) cache.delete(firstKey);
-          }
-
-          return res.status(200).json({
-            success: true,
-            imageData: result.imageData,
-            contentType: result.contentType,
-            provider: provider.name,
-          });
+        if (!result) {
+          throw new Error(`${provider.name} returned no result`);
         }
-      } catch (e) {
-        console.error(`[Provider] ${provider.name} error:`, (e as Error).message);
-      }
-    }
+        console.log(`[Provider] ${provider.name} succeeded`);
+        return { ...result, providerName: provider.name };
+      })(),
+    );
 
-    return res.status(502).json({
-      success: false,
-      error: "All providers failed. Please try again later.",
-    });
+    try {
+      const winner = await Promise.any(providerPromises);
+
+      // Cache successful result
+      cache.set(cacheKey, { data: winner.imageData, contentType: winner.contentType, ts: Date.now() });
+      // Limit cache size
+      if (cache.size > 100) {
+        const firstKey = cache.keys().next().value;
+        if (firstKey) cache.delete(firstKey);
+      }
+
+      return res.status(200).json({
+        success: true,
+        imageData: winner.imageData,
+        contentType: winner.contentType,
+        provider: winner.providerName,
+      });
+    } catch (aggErr) {
+      // All providers failed — log individual reasons
+      if (aggErr instanceof AggregateError) {
+        aggErr.errors.forEach((err, i) => {
+          console.error(`[Provider] ${providers[i].name} failed:`, (err as Error).message);
+        });
+      } else {
+        console.error("[Provider] All providers failed:", aggErr);
+      }
+
+      return res.status(502).json({
+        success: false,
+        error: "All providers failed. Please try again later.",
+      });
+    }
   } catch (e) {
     console.error("[Handler] Unexpected error:", e);
     return res.status(500).json({
