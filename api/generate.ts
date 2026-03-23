@@ -10,6 +10,10 @@ const HF_SPACE_URLS = [
 const REPLICATE_API_URL = "https://api.replicate.com/v1/predictions";
 const STABLE_HORDE_API_URL = "https://stablehorde.net/api/v2";
 
+const ANGLECHANGER_API_URL = "https://anglechanger.ai/api";
+const ANGLECHANGER_POLL_INTERVAL = 2_000;
+const ANGLECHANGER_MAX_POLLS = 30; // 30 * 2s = 60s max
+
 const GENERATION_DEFAULTS = {
   guidanceScale: 1.0,
   inferenceSteps: 4,
@@ -475,6 +479,144 @@ async function tryStableHorde(
   }
 }
 
+// ===== Provider 5: AngleChanger.ai =====
+async function tryAngleChanger(
+  imageBuffer: Buffer,
+  rotateDeg: number,
+  _moveForward: number,
+  verticalTilt: number,
+  _wideangle: boolean,
+): Promise<{ imageData: string; contentType: string } | null> {
+  try {
+    console.log("[AngleChanger] Starting...");
+
+    // Step 1: Upload image to anglechanger.ai
+    const uploadForm = new FormData();
+    const blob = new Blob([imageBuffer], { type: "image/png" });
+    uploadForm.append("image", blob, "input.png");
+
+    const uploadResp = await fetch(`${ANGLECHANGER_API_URL}/upload.php`, {
+      method: "POST",
+      body: uploadForm,
+      signal: timeoutSignal(UPLOAD_TIMEOUT),
+    });
+
+    if (!uploadResp.ok) {
+      console.warn(`[AngleChanger] Upload failed: ${uploadResp.status}`);
+      return null;
+    }
+
+    const uploadResult = (await uploadResp.json()) as {
+      success: boolean;
+      data?: { url: string; filename: string };
+    };
+
+    if (!uploadResult.success || !uploadResult.data?.url) {
+      console.warn("[AngleChanger] Upload response missing URL");
+      return null;
+    }
+
+    const imageUrl = uploadResult.data.url;
+    console.log(`[AngleChanger] Image uploaded: ${imageUrl}`);
+
+    // Step 2: Request angle change generation
+    // AngleChanger expects horizontal_angle as (360 - angle) % 360 (inverted)
+    const hAngle = ((360 - Math.round(rotateDeg)) % 360 + 360) % 360;
+    // verticalTilt is -1.0..1.0, map back to degrees (-60..60), clamp to AngleChanger range (-30..90)
+    const vAngle = Math.max(-30, Math.min(90, Math.round(verticalTilt * 60)));
+    const zoom = 5; // default zoom level
+
+    const generateResp = await fetch(`${ANGLECHANGER_API_URL}/generate.php`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image_url: imageUrl,
+        horizontal_angle: hAngle,
+        vertical_angle: vAngle,
+        zoom,
+        resolution: "auto",
+      }),
+      signal: timeoutSignal(PROVIDER_TIMEOUT),
+    });
+
+    if (!generateResp.ok) {
+      console.warn(`[AngleChanger] Generate failed: ${generateResp.status}`);
+      return null;
+    }
+
+    const generateResult = (await generateResp.json()) as {
+      success: boolean;
+      data?: { request_id: string; image_id: string };
+      message?: string;
+    };
+
+    if (!generateResult.success || !generateResult.data?.request_id) {
+      console.warn(`[AngleChanger] Generate rejected: ${generateResult.message || "unknown"}`);
+      return null;
+    }
+
+    const { request_id, image_id } = generateResult.data;
+    console.log(`[AngleChanger] Generation started: request_id=${request_id}`);
+
+    // Step 3: Poll for completion
+    let resultUrl: string | null = null;
+    for (let attempt = 0; attempt < ANGLECHANGER_MAX_POLLS; attempt++) {
+      await new Promise((r) => setTimeout(r, ANGLECHANGER_POLL_INTERVAL));
+
+      const statusResp = await fetch(
+        `${ANGLECHANGER_API_URL}/check-status.php?request_id=${encodeURIComponent(request_id)}&image_id=${encodeURIComponent(image_id)}`,
+        { signal: timeoutSignal(15_000) },
+      );
+
+      if (!statusResp.ok) continue;
+
+      const statusResult = (await statusResp.json()) as {
+        success: boolean;
+        data?: { status: string; result_url?: string };
+      };
+
+      if (statusResult.success && statusResult.data?.status === "completed" && statusResult.data.result_url) {
+        resultUrl = statusResult.data.result_url;
+        break;
+      }
+
+      if (statusResult.success && statusResult.data?.status === "failed") {
+        console.warn("[AngleChanger] Generation failed on remote");
+        return null;
+      }
+
+      // status === "processing" → keep polling
+    }
+
+    if (!resultUrl) {
+      console.warn("[AngleChanger] Timed out waiting for result");
+      return null;
+    }
+
+    console.log(`[AngleChanger] Result ready: ${resultUrl}`);
+
+    // Step 4: Download result image
+    const imageResp = await fetch(resultUrl, {
+      signal: timeoutSignal(30_000),
+    });
+
+    if (!imageResp.ok) {
+      console.warn(`[AngleChanger] Image download failed: ${imageResp.status}`);
+      return null;
+    }
+
+    const imageBlob = await imageResp.blob();
+    const arrayBuffer = await imageBlob.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    const contentType = imageBlob.type || "image/jpeg";
+
+    return { imageData: base64, contentType };
+  } catch (e) {
+    console.warn("[AngleChanger] Error:", (e as Error).message);
+    return null;
+  }
+}
+
 // ===== Main handler =====
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // CORS headers
@@ -491,12 +633,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { imageData, rotateDeg, moveForward, verticalTilt, wideangle } = req.body as {
+    const { imageData, rotateDeg, moveForward, verticalTilt, wideangle, provider: requestedProvider } = req.body as {
       imageData: string;
       rotateDeg: number;
       moveForward: number;
       verticalTilt: number;
       wideangle: boolean;
+      provider?: string;
     };
 
     if (!imageData) {
@@ -525,27 +668,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // Run all providers in parallel with Promise.any for speed optimization.
     // The first provider to succeed wins; if all fail, return error.
-    const providers: Array<{
+    const allProviders: Array<{
       name: string;
+      key: string;
       fn: () => Promise<{ imageData: string; contentType: string } | null>;
     }> = [
       {
         name: "HuggingFace Inference",
+        key: "hf-inference",
         fn: () => tryHuggingFaceInference(imageData, rotate, forward, tilt, wide),
       },
       {
         name: "HuggingFace Space",
+        key: "hf-space",
         fn: () => tryHFSpace(imageBuffer, rotate, forward, tilt, wide),
       },
       {
         name: "Replicate",
+        key: "replicate",
         fn: () => tryReplicate(imageData, rotate, forward, tilt, wide),
       },
       {
         name: "Stable Horde",
+        key: "stable-horde",
         fn: () => tryStableHorde(imageData, rotate, forward, tilt, wide),
       },
+      {
+        name: "AngleChanger.ai",
+        key: "anglechanger",
+        fn: () => tryAngleChanger(imageBuffer, rotate, forward, tilt, wide),
+      },
     ];
+
+    // Filter to requested provider if specified, otherwise use all
+    const providers = requestedProvider
+      ? allProviders.filter((p) => p.key === requestedProvider)
+      : allProviders;
+
+    if (providers.length === 0) {
+      return res.status(400).json({ error: `Unknown provider: ${requestedProvider}` });
+    }
 
     // Wrap each provider so null results become rejections for Promise.any
     const providerPromises = providers.map((provider) =>

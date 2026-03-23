@@ -120,27 +120,43 @@ async function optimizeImage(file: File, maxSize = 2048): Promise<string> {
 }
 
 // ===== API call through Vercel serverless function =====
+// ===== Provider Options =====
+const PROVIDER_OPTIONS = [
+  { value: "", label: "Auto (All Providers)", description: "Fastest available" },
+  { value: "anglechanger", label: "AngleChanger.ai", description: "Dedicated angle AI" },
+  { value: "hf-space", label: "HuggingFace Space", description: "Qwen Image Edit" },
+  { value: "hf-inference", label: "HF Inference", description: "Zero-1-to-3" },
+  { value: "replicate", label: "Replicate", description: "Cloud GPU" },
+  { value: "stable-horde", label: "Stable Horde", description: "Distributed" },
+];
+
 async function generateAngleViaAPI(
   imageBase64: string,
   rotateDeg: number,
   moveForward: number,
   verticalTilt: number,
   wideangle: boolean,
+  provider?: string,
 ): Promise<{ imageData: string; contentType: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min max
 
   try {
+    const body: Record<string, unknown> = {
+      imageData: imageBase64,
+      rotateDeg,
+      moveForward,
+      verticalTilt,
+      wideangle,
+    };
+    if (provider) {
+      body.provider = provider;
+    }
+
     const response = await fetch("/api/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        imageData: imageBase64,
-        rotateDeg,
-        moveForward,
-        verticalTilt,
-        wideangle,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 
@@ -409,6 +425,7 @@ function App() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [selectedAngle, setSelectedAngle] = useState(PREDEFINED_ANGLES[0]);
   const [lens, setLens] = useState("normal");
+  const [provider, setProvider] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [resultImage, setResultImage] = useState<{ imageData: string; contentType: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -487,6 +504,7 @@ function App() {
         forward,
         tilt,
         isWide,
+        provider || undefined,
       );
 
       setResultImage(result);
@@ -611,6 +629,29 @@ function App() {
                     )}
                   >
                     {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Provider Selection */}
+            <div className="rounded-2xl bg-gray-950/60 border border-gray-800/50 p-5">
+              <h3 className="text-white font-semibold mb-3">AI Provider</h3>
+              <div className="space-y-2">
+                {PROVIDER_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    onClick={() => setProvider(opt.value)}
+                    className={"w-full flex items-center justify-between px-4 py-2.5 rounded-xl text-left transition-all " + (
+                      provider === opt.value
+                        ? "bg-[#CDFF00]/10 border border-[#CDFF00]/40 text-white"
+                        : "bg-gray-900 border border-gray-700 text-gray-300 hover:border-gray-500"
+                    )}
+                  >
+                    <span className="text-sm font-medium">{opt.label}</span>
+                    <span className={"text-xs " + (provider === opt.value ? "text-[#CDFF00]/70" : "text-gray-500")}>
+                      {opt.description}
+                    </span>
                   </button>
                 ))}
               </div>
