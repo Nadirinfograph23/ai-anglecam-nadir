@@ -3,7 +3,6 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 // ===== Configuration =====
 const HF_SPACE_URLS = [
   "https://linoyts-qwen-image-edit-angles.hf.space",
-  "https://linoyts-qwen2-5-image-edit.hf.space",
 ];
 
 const REPLICATE_API_URL = "https://api.replicate.com/v1/predictions";
@@ -17,7 +16,6 @@ const GENERATION_DEFAULTS = {
 };
 
 const PROVIDER_TIMEOUT = 120_000; // 120s per provider
-const UPLOAD_TIMEOUT = 60_000;
 
 // ===== Simple in-memory cache (per cold-start) =====
 const cache = new Map<string, { data: string; contentType: string; ts: number }>();
@@ -96,32 +94,7 @@ async function tryHuggingFaceInference(
 }
 
 // ===== Provider 2: HuggingFace Space (Gradio API - Qwen Image Edit Angles) =====
-async function uploadToHFSpace(imageBuffer: Buffer, spaceUrl: string): Promise<string> {
-  const formData = new FormData();
-  const blob = new Blob([imageBuffer], { type: "image/png" });
-  formData.append("files", blob, "input.png");
-
-  const headers: Record<string, string> = {};
-  if (process.env.HF_API_TOKEN) {
-    headers["Authorization"] = `Bearer ${process.env.HF_API_TOKEN}`;
-  }
-
-  const response = await fetch(`${spaceUrl}/gradio_api/upload`, {
-    method: "POST",
-    body: formData,
-    headers,
-    signal: timeoutSignal(UPLOAD_TIMEOUT),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Upload failed (${response.status}): ${text.slice(0, 200)}`);
-  }
-
-  const result = await response.json();
-  if (Array.isArray(result) && result.length > 0) return result[0] as string;
-  throw new Error("Unexpected upload response format");
-}
+// Uses /infer_edit_camera_angles endpoint which accepts base64 images directly (no upload needed)
 
 function parseSSEForImageUrl(text: string): string {
   const lines = text.split("\n");
@@ -139,10 +112,18 @@ function parseSSEForImageUrl(text: string): string {
         if (errorMsg && typeof data === "string") {
           throw new Error(data);
         }
+        // infer_edit_camera_angles returns image data directly
+        if (data && typeof data === "object" && !Array.isArray(data)) {
+          if ("url" in data) return (data as { url: string }).url;
+          if ("path" in data) return (data as { path: string }).path;
+        }
         if (Array.isArray(data) && data.length > 0) {
           const first = data[0];
           if (first && typeof first === "object" && "url" in first) {
             return (first as { url: string }).url;
+          }
+          if (first && typeof first === "object" && "path" in first) {
+            return (first as { path: string }).path;
           }
         }
       } catch (e) {
@@ -155,7 +136,7 @@ function parseSSEForImageUrl(text: string): string {
 }
 
 async function tryHFSpace(
-  imageBuffer: Buffer,
+  imageBase64: string,
   rotateDeg: number,
   moveForward: number,
   verticalTilt: number,
@@ -163,9 +144,7 @@ async function tryHFSpace(
 ): Promise<{ imageData: string; contentType: string } | null> {
   for (const spaceUrl of HF_SPACE_URLS) {
     try {
-      console.log(`[HF Space] Trying ${spaceUrl}...`);
-
-      const uploadedPath = await uploadToHFSpace(imageBuffer, spaceUrl);
+      console.log(`[HF Space] Trying ${spaceUrl} /infer_edit_camera_angles...`);
 
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
@@ -174,26 +153,21 @@ async function tryHFSpace(
         headers["Authorization"] = `Bearer ${process.env.HF_API_TOKEN}`;
       }
 
+      // Use /infer_edit_camera_angles which accepts base64 via the url field directly
       const payload = {
         data: [
-          false,
-          { path: uploadedPath, meta: { _type: "gradio.FileData" } },
+          { url: `data:image/png;base64,${imageBase64}` },
           rotateDeg,
           moveForward,
           verticalTilt,
           wideangle,
           0,
           true,
-          GENERATION_DEFAULTS.guidanceScale,
-          GENERATION_DEFAULTS.inferenceSteps,
-          GENERATION_DEFAULTS.width,
-          GENERATION_DEFAULTS.height,
-          null,
         ],
       };
 
       const submitResponse = await fetch(
-        `${spaceUrl}/gradio_api/call/maybe_infer`,
+        `${spaceUrl}/gradio_api/call/infer_edit_camera_angles`,
         {
           method: "POST",
           headers,
@@ -221,7 +195,7 @@ async function tryHFSpace(
       }
 
       const resultResponse = await fetch(
-        `${spaceUrl}/gradio_api/call/maybe_infer/${eventId}`,
+        `${spaceUrl}/gradio_api/call/infer_edit_camera_angles/${eventId}`,
         {
           headers: resultHeaders,
           signal: timeoutSignal(PROVIDER_TIMEOUT),
@@ -236,7 +210,10 @@ async function tryHFSpace(
       const sseText = await resultResponse.text();
       const imageUrl = parseSSEForImageUrl(sseText);
 
-      const imageResponse = await fetch(imageUrl, {
+      // The URL might be relative to the space or absolute
+      const fullUrl = imageUrl.startsWith("http") ? imageUrl : `${spaceUrl}${imageUrl.startsWith("/") ? "" : "/"}${imageUrl}`;
+
+      const imageResponse = await fetch(fullUrl, {
         headers: resultHeaders,
         signal: timeoutSignal(30_000),
       });
@@ -503,7 +480,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
       {
         name: "HuggingFace Space",
-        fn: () => tryHFSpace(imageBuffer, rotate, forward, tilt, wide),
+        fn: () => tryHFSpace(imageData, rotate, forward, tilt, wide),
       },
       {
         name: "Replicate",
