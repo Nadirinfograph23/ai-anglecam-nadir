@@ -45,44 +45,21 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-// ===== Multiple HuggingFace Space URLs for failover =====
-const HF_SPACE_URLS = [
-  "https://linoyts-qwen-image-edit-angles.hf.space",
-  "https://linoyts-qwen2-5-image-edit.hf.space",
-];
-
-let currentSpaceIndex = 0;
-
-function getNextSpaceUrl(): string {
-  currentSpaceIndex = (currentSpaceIndex + 1) % HF_SPACE_URLS.length;
-  return HF_SPACE_URLS[currentSpaceIndex];
-}
-
-function getCurrentSpaceUrl(): string {
-  return HF_SPACE_URLS[currentSpaceIndex];
-}
-
+// ===== Camera Angle Presets with professional terminology =====
 const PREDEFINED_ANGLES = [
-  { name: "Front", h: 0, v: 0 },
-  { name: "Front Right", h: 45, v: 0 },
-  { name: "Right", h: 90, v: 0 },
-  { name: "Back Right", h: 135, v: 0 },
-  { name: "Back", h: 180, v: 0 },
-  { name: "Back Left", h: -135, v: 0 },
-  { name: "Left", h: -90, v: 0 },
-  { name: "Front Left", h: -45, v: 0 },
-  { name: "Top View", h: 0, v: 60 },
+  { name: "Eye Level", h: 0, v: 0 },
+  { name: "3/4 Front Right", h: 45, v: 0 },
+  { name: "Profile Right", h: 90, v: 0 },
+  { name: "3/4 Back Right", h: 135, v: 0 },
+  { name: "Rear View", h: 180, v: 0 },
+  { name: "3/4 Back Left", h: -135, v: 0 },
+  { name: "Profile Left", h: -90, v: 0 },
+  { name: "3/4 Front Left", h: -45, v: 0 },
+  { name: "Bird's Eye View", h: 0, v: 60 },
   { name: "Low Angle", h: 0, v: -30 },
-  { name: "Bird Eye 45", h: 45, v: 45 },
+  { name: "High Angle 3/4", h: 45, v: 45 },
   { name: "Dutch Angle", h: 30, v: 15 },
 ];
-
-const GENERATION_DEFAULTS = {
-  guidanceScale: 1.0,
-  inferenceSteps: 4,
-  width: 1024,
-  height: 1024,
-};
 
 // ===== Angle Conversion Helpers =====
 function clampRotate(deg: number): number {
@@ -101,8 +78,8 @@ function convertForward(lens: string): number {
   return mapping[lens] ?? 2.0;
 }
 
-// ===== Image Optimization =====
-async function optimizeImage(file: File, maxSize = 2048): Promise<Blob> {
+// ===== Image Optimization (returns base64 string for API route) =====
+async function optimizeImage(file: File, maxSize = 2048): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const objectUrl = URL.createObjectURL(file);
@@ -121,7 +98,16 @@ async function optimizeImage(file: File, maxSize = 2048): Promise<Blob> {
       if (!ctx) { reject(new Error("Canvas context unavailable")); return; }
       ctx.drawImage(img, 0, 0, width, height);
       canvas.toBlob(
-        (blob) => blob ? resolve(blob) : reject(new Error("Image conversion failed")),
+        (blob) => {
+          if (!blob) { reject(new Error("Image conversion failed")); return; }
+          const reader = new FileReader();
+          reader.onload = () => {
+            const result = reader.result as string;
+            resolve(result.split(",")[1] || "");
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        },
         "image/png"
       );
     };
@@ -133,217 +119,127 @@ async function optimizeImage(file: File, maxSize = 2048): Promise<Blob> {
   });
 }
 
-// ===== HuggingFace Gradio API Client with failover =====
-async function uploadToHF(imageBlob: Blob, spaceUrl: string): Promise<string> {
-  const formData = new FormData();
-  formData.append("files", imageBlob, "input.png");
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-
-  try {
-    const response = await fetch(spaceUrl + "/gradio_api/upload", {
-      method: "POST",
-      body: formData,
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error("Upload failed (" + response.status + "): " + text.slice(0, 200));
-    }
-
-    const result = await response.json();
-    if (Array.isArray(result) && result.length > 0) return result[0];
-    throw new Error("Unexpected upload response format");
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function parseSSEForImageUrl(text: string): string {
-  const lines = text.split("\n");
-  let errorMsg = "";
-
-  for (const line of lines) {
-    if (line.startsWith("event: error")) {
-      errorMsg = "API returned an error";
-    }
-    if (line.startsWith("data: ")) {
-      const dataStr = line.substring(6).trim();
-      if (dataStr === "null") continue;
-      try {
-        const data = JSON.parse(dataStr);
-        if (errorMsg && typeof data === "string") {
-          throw new Error(data);
-        }
-        if (Array.isArray(data) && data.length > 0) {
-          const first = data[0];
-          if (first && typeof first === "object" && "url" in first) {
-            return (first as { url: string }).url;
-          }
-        }
-      } catch (e) {
-        if (e instanceof Error && e.message !== "No image URL found") throw e;
-        continue;
-      }
-    }
-  }
-  throw new Error(errorMsg || "No image URL found in API response");
-}
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result.split(",")[1] || "");
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function generateSingleAngleFromHF(
-  uploadedPath: string,
+// ===== API call through Vercel serverless function =====
+async function generateAngleViaAPI(
+  imageBase64: string,
   rotateDeg: number,
   moveForward: number,
   verticalTilt: number,
   wideangle: boolean,
-  spaceUrl: string,
 ): Promise<{ imageData: string; contentType: string }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120000);
+  const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min max
 
   try {
-    const payload = {
-      data: [
-        false,
-        { path: uploadedPath, meta: { _type: "gradio.FileData" } },
+    const response = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        imageData: imageBase64,
         rotateDeg,
         moveForward,
         verticalTilt,
         wideangle,
-        0,
-        true,
-        GENERATION_DEFAULTS.guidanceScale,
-        GENERATION_DEFAULTS.inferenceSteps,
-        GENERATION_DEFAULTS.width,
-        GENERATION_DEFAULTS.height,
-        null,
-      ],
-    };
-
-    const submitResponse = await fetch(spaceUrl + "/gradio_api/call/maybe_infer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      }),
       signal: controller.signal,
     });
 
-    if (!submitResponse.ok) {
-      const text = await submitResponse.text().catch(() => "");
-      throw new Error("Generation submit failed (" + submitResponse.status + "): " + text.slice(0, 200));
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({ error: "Server error" })) as { error?: string };
+      throw new Error(errData.error || "Server error (" + response.status + ")");
     }
 
-    const submitData = await submitResponse.json();
-    const eventId = submitData.event_id;
-    if (!eventId) throw new Error("No event_id in API response");
+    const data = await response.json() as {
+      success: boolean;
+      imageData?: string;
+      contentType?: string;
+      error?: string;
+      provider?: string;
+    };
 
-    const resultResponse = await fetch(
-      spaceUrl + "/gradio_api/call/maybe_infer/" + eventId,
-      { signal: controller.signal }
-    );
-
-    if (!resultResponse.ok) {
-      throw new Error("Result polling failed (" + resultResponse.status + ")");
+    if (!data.success || !data.imageData) {
+      throw new Error(data.error || "Generation failed");
     }
 
-    const sseText = await resultResponse.text();
-    const imageUrl = parseSSEForImageUrl(sseText);
-
-    const imageResponse = await fetch(imageUrl, { signal: controller.signal });
-    if (!imageResponse.ok) {
-      throw new Error("Image download failed (" + imageResponse.status + ")");
-    }
-
-    const blob = await imageResponse.blob();
-    const contentType = blob.type || "image/webp";
-    const imageData = await blobToBase64(blob);
-
-    return { imageData, contentType };
+    console.log("[Generate] Success via " + data.provider);
+    return { imageData: data.imageData, contentType: data.contentType || "image/png" };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-/** Retry with failover across multiple HF Space endpoints */
-async function withFailoverRetry(
-  fn: (spaceUrl: string) => Promise<{ imageData: string; contentType: string }>,
-  maxRetries = 3,
-  baseDelay = 2000,
-  label = "",
-): Promise<{ imageData: string; contentType: string }> {
-  let lastError: Error | null = null;
-  const totalAttempts = maxRetries * HF_SPACE_URLS.length;
-
-  for (let attempt = 0; attempt < totalAttempts; attempt++) {
-    const spaceUrl = getCurrentSpaceUrl();
-    try {
-      return await fn(spaceUrl);
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn(
-        "[HF] " + label + " attempt " + (attempt + 1) + "/" + totalAttempts +
-        " failed on " + spaceUrl + ":", lastError.message
-      );
-      getNextSpaceUrl();
-      if (attempt < totalAttempts - 1) {
-        const delay = Math.min(baseDelay * Math.pow(1.5, attempt % maxRetries), 15000);
-        await new Promise((r) => setTimeout(r, delay));
-      }
-    }
-  }
-  throw lastError || new Error(label + " failed after " + totalAttempts + " attempts");
-}
-
-/** Upload with failover across endpoints */
-async function uploadWithFailover(imageBlob: Blob): Promise<{ path: string; spaceUrl: string }> {
-  let lastError: Error | null = null;
-  for (let i = 0; i < HF_SPACE_URLS.length * 2; i++) {
-    const spaceUrl = getCurrentSpaceUrl();
-    try {
-      const path = await uploadToHF(imageBlob, spaceUrl);
-      return { path, spaceUrl };
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn("[HF] Upload failed on " + spaceUrl + ":", lastError.message);
-      getNextSpaceUrl();
-      if (i < HF_SPACE_URLS.length * 2 - 1) {
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-    }
-  }
-  throw lastError || new Error("Upload failed on all endpoints");
-}
-
-// ===== 3D Camera Preview Component =====
+// ===== Interactive 3D Camera Preview Component =====
 function CameraPreview3D({
   horizontalAngle,
   verticalAngle,
   imageSrc,
+  onAngleChange,
 }: {
   horizontalAngle: number;
   verticalAngle: number;
   imageSrc: string | null;
+  onAngleChange?: (h: number, v: number) => void;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+  const lastPos = useRef({ x: 0, y: 0 });
+
   const rotateY = -horizontalAngle;
   const rotateX = verticalAngle * 0.5;
 
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (!onAngleChange) return;
+    isDragging.current = true;
+    lastPos.current = { x: e.clientX, y: e.clientY };
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }, [onAngleChange]);
+
+  const handlePointerMove = useCallback((e: React.PointerEvent) => {
+    if (!isDragging.current || !onAngleChange) return;
+    const dx = e.clientX - lastPos.current.x;
+    const dy = e.clientY - lastPos.current.y;
+    lastPos.current = { x: e.clientX, y: e.clientY };
+
+    const sensitivity = 0.5;
+    let newH = horizontalAngle + dx * sensitivity;
+    let newV = verticalAngle - dy * sensitivity;
+
+    newH = clampRotate(newH);
+    newV = Math.max(-60, Math.min(60, newV));
+
+    newH = Math.round(newH / 5) * 5;
+    newV = Math.round(newV / 5) * 5;
+
+    onAngleChange(newH, newV);
+  }, [horizontalAngle, verticalAngle, onAngleChange]);
+
+  const handlePointerUp = useCallback(() => {
+    isDragging.current = false;
+  }, []);
+
+  const handleCompassClick = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    if (!onAngleChange) return;
+    const svg = e.currentTarget;
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = e.clientX - cx;
+    const dy = e.clientY - cy;
+    const angle = Math.atan2(dx, -dy) * (180 / Math.PI);
+    const snapped = Math.round(angle / 15) * 15;
+    onAngleChange(clampRotate(snapped), verticalAngle);
+  }, [onAngleChange, verticalAngle]);
+
   return (
     <div
-      className="relative w-full aspect-square rounded-2xl overflow-hidden border-2 border-gray-700 bg-gray-900/60"
+      ref={containerRef}
+      className={"relative w-full aspect-square rounded-2xl overflow-hidden border-2 bg-gray-900/60 " +
+        (onAngleChange ? "border-cyan-700/50 cursor-grab active:cursor-grabbing" : "border-gray-700")}
       style={{ perspective: "800px" }}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerLeave={handlePointerUp}
     >
       <div className="absolute inset-0 flex items-center justify-center">
         <div
@@ -351,7 +247,7 @@ function CameraPreview3D({
           style={{
             transformStyle: "preserve-3d",
             transform: "rotateX(" + (20 + rotateX) + "deg) rotateY(" + rotateY + "deg)",
-            transition: "transform 0.4s ease-out",
+            transition: isDragging.current ? "none" : "transform 0.4s ease-out",
           }}
         >
           {imageSrc ? (
@@ -362,7 +258,7 @@ function CameraPreview3D({
                 transform: "translateZ(1px)",
               }}
             >
-              <img src={imageSrc} alt="Preview" className="w-full h-full object-cover" />
+              <img src={imageSrc} alt="Preview" className="w-full h-full object-cover pointer-events-none" />
               <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent" />
             </div>
           ) : (
@@ -410,8 +306,14 @@ function CameraPreview3D({
         {"H: " + horizontalAngle + "\u00B0 / V: " + verticalAngle + "\u00B0"}
       </div>
 
-      <div className="absolute bottom-3 right-3 w-12 h-12">
-        <svg viewBox="0 0 48 48" className="w-full h-full">
+      {onAngleChange && (
+        <div className="absolute top-3 right-3 bg-gray-900/80 backdrop-blur-sm rounded-lg px-2.5 py-1.5 text-xs text-gray-400">
+          Drag to rotate
+        </div>
+      )}
+
+      <div className="absolute bottom-3 right-3 w-14 h-14">
+        <svg viewBox="0 0 48 48" className="w-full h-full cursor-pointer" onClick={handleCompassClick}>
           <circle cx="24" cy="24" r="20" fill="rgba(0,0,0,0.5)" stroke="rgba(100,200,255,0.3)" strokeWidth="1" />
           <text x="24" y="10" textAnchor="middle" fill="rgba(100,200,255,0.6)" fontSize="7" fontWeight="bold">N</text>
           <text x="24" y="42" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">S</text>
@@ -545,6 +447,24 @@ function App() {
     [handleFileSelect]
   );
 
+  // Handle interactive angle change from 3D preview drag
+  const handleAngleChange = useCallback((h: number, v: number) => {
+    let closest = PREDEFINED_ANGLES[0];
+    let minDist = Infinity;
+    for (const angle of PREDEFINED_ANGLES) {
+      const dist = Math.abs(angle.h - h) + Math.abs(angle.v - v);
+      if (dist < minDist) {
+        minDist = dist;
+        closest = angle;
+      }
+    }
+    if (minDist <= 15) {
+      setSelectedAngle(closest);
+    } else {
+      setSelectedAngle({ name: "Custom (" + h + "\u00B0, " + v + "\u00B0)", h, v });
+    }
+  }, []);
+
   const generateAngle = async () => {
     if (!imageFile) return;
     setIsGenerating(true);
@@ -553,28 +473,20 @@ function App() {
     setStatusMsg("Optimizing image...");
 
     try {
-      const optimized = await optimizeImage(imageFile);
-      setStatusMsg("Uploading to AI server...");
-
-      const { path: uploadedPath, spaceUrl } = await uploadWithFailover(optimized);
+      const imageBase64 = await optimizeImage(imageFile);
+      setStatusMsg("Generating " + selectedAngle.name + " view...");
 
       const rotate = clampRotate(selectedAngle.h);
       const forward = convertForward(lens);
       const tilt = convertVertical(selectedAngle.v);
       const isWide = lens === "wide";
 
-      setStatusMsg("Generating " + selectedAngle.name + " view...");
-
-      const result = await withFailoverRetry(
-        async (currentUrl) => {
-          let finalPath = uploadedPath;
-          if (currentUrl !== spaceUrl) {
-            setStatusMsg("Re-uploading to backup server...");
-            finalPath = await uploadToHF(optimized, currentUrl);
-          }
-          return generateSingleAngleFromHF(finalPath, rotate, forward, tilt, isWide, currentUrl);
-        },
-        3, 2000, selectedAngle.name
+      const result = await generateAngleViaAPI(
+        imageBase64,
+        rotate,
+        forward,
+        tilt,
+        isWide,
       );
 
       setResultImage(result);
@@ -616,7 +528,7 @@ function App() {
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Sparkles className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Powered by Qwen Image Edit</span>
+              <span className="hidden sm:inline">Multi-Provider AI Engine</span>
             </div>
           </div>
         </div>
@@ -626,7 +538,7 @@ function App() {
         <div className="mb-6">
           <h2 className="text-2xl font-bold text-white">Generate Camera Angle View</h2>
           <p className="text-gray-400 text-sm mt-1">
-            Upload an image, choose a camera angle, and generate a new perspective instantly
+            Upload an image, choose a camera angle or drag to set a custom angle, and generate a new perspective
           </p>
         </div>
 
@@ -679,6 +591,9 @@ function App() {
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
               <h3 className="text-white font-semibold mb-3">Camera Angle</h3>
               <AngleDropdown selectedAngle={selectedAngle} onSelect={setSelectedAngle} />
+              <p className="text-xs text-gray-500 mt-2">
+                Or drag on the 3D preview to set a custom angle
+              </p>
             </div>
 
             {/* Lens Type */}
@@ -746,6 +661,7 @@ function App() {
                 horizontalAngle={selectedAngle.h}
                 verticalAngle={selectedAngle.v}
                 imageSrc={selectedImage}
+                onAngleChange={handleAngleChange}
               />
             </div>
 

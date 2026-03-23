@@ -1,0 +1,7 @@
+{
+  "name": "ai-anglecam-nadir",
+  "private": true,
+  "dependencies": {
+    "@vercel/node": "^3.0.0"
+  }
+}
