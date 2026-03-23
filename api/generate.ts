@@ -9,6 +9,7 @@ const HF_SPACE_URLS = [
 
 const REPLICATE_API_URL = "https://api.replicate.com/v1/predictions";
 const STABLE_HORDE_API_URL = "https://stablehorde.net/api/v2";
+const QWEN_ANGLES_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
 
 const GENERATION_DEFAULTS = {
   guidanceScale: 1.0,
@@ -475,6 +476,120 @@ async function tryStableHorde(
   }
 }
 
+// ===== Provider 5: Qwen Image Edit Angles (Direct /infer_edit_camera_angles endpoint) =====
+async function tryQwenEditAngles(
+  imageBuffer: Buffer,
+  rotateDeg: number,
+  moveForward: number,
+  verticalTilt: number,
+  wideangle: boolean,
+): Promise<{ imageData: string; contentType: string } | null> {
+  try {
+    console.log("[Qwen Edit Angles] Starting via /infer_edit_camera_angles...");
+
+    // Health check
+    const healthResp = await fetch(`${QWEN_ANGLES_SPACE_URL}/gradio_api/info`, {
+      signal: timeoutSignal(10_000),
+    }).catch(() => null);
+    if (!healthResp || !healthResp.ok) {
+      console.warn(`[Qwen Edit Angles] Space is not reachable (status: ${healthResp?.status ?? "network error"})`);
+      return null;
+    }
+
+    // Upload the image
+    const uploadedPath = await uploadToHFSpace(imageBuffer, QWEN_ANGLES_SPACE_URL);
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (process.env.HF_API_TOKEN) {
+      headers["Authorization"] = `Bearer ${process.env.HF_API_TOKEN}`;
+    }
+
+    // Call the dedicated /infer_edit_camera_angles endpoint
+    const payload = {
+      data: [
+        { path: uploadedPath, meta: { _type: "gradio.FileData" } },
+        rotateDeg,
+        moveForward,
+        verticalTilt,
+        wideangle,
+        0,
+        true,
+        GENERATION_DEFAULTS.guidanceScale,
+        GENERATION_DEFAULTS.inferenceSteps,
+        null,
+        null,
+        null,
+      ],
+    };
+
+    const submitResponse = await fetch(
+      `${QWEN_ANGLES_SPACE_URL}/gradio_api/call/infer_edit_camera_angles`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: timeoutSignal(PROVIDER_TIMEOUT),
+      },
+    );
+
+    if (!submitResponse.ok) {
+      const text = await submitResponse.text().catch(() => "");
+      console.warn(`[Qwen Edit Angles] Submit failed: ${submitResponse.status} ${text.slice(0, 200)}`);
+      return null;
+    }
+
+    const submitData = (await submitResponse.json()) as { event_id?: string };
+    const eventId = submitData.event_id;
+    if (!eventId) {
+      console.warn("[Qwen Edit Angles] No event_id received");
+      return null;
+    }
+
+    const resultHeaders: Record<string, string> = {};
+    if (process.env.HF_API_TOKEN) {
+      resultHeaders["Authorization"] = `Bearer ${process.env.HF_API_TOKEN}`;
+    }
+
+    const resultResponse = await fetch(
+      `${QWEN_ANGLES_SPACE_URL}/gradio_api/call/infer_edit_camera_angles/${eventId}`,
+      {
+        headers: resultHeaders,
+        signal: timeoutSignal(PROVIDER_TIMEOUT),
+      },
+    );
+
+    if (!resultResponse.ok) {
+      console.warn(`[Qwen Edit Angles] Result polling failed: ${resultResponse.status}`);
+      return null;
+    }
+
+    const sseText = await resultResponse.text();
+    const imageUrl = parseSSEForImageUrl(sseText);
+
+    const imageResponse = await fetch(imageUrl, {
+      headers: resultHeaders,
+      signal: timeoutSignal(30_000),
+    });
+
+    if (!imageResponse.ok) {
+      console.warn(`[Qwen Edit Angles] Image download failed: ${imageResponse.status}`);
+      return null;
+    }
+
+    const imageBlob = await imageResponse.blob();
+    const arrayBuffer = await imageBlob.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    const contentType = imageBlob.type || "image/webp";
+
+    return { imageData: base64, contentType };
+  } catch (e) {
+    console.warn("[Qwen Edit Angles] Error:", (e as Error).message);
+    return null;
+  }
+}
+
 // ===== Main handler =====
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // CORS headers
@@ -544,6 +659,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       {
         name: "Stable Horde",
         fn: () => tryStableHorde(imageData, rotate, forward, tilt, wide),
+      },
+      {
+        name: "Qwen Edit Angles",
+        fn: () => tryQwenEditAngles(imageBuffer, rotate, forward, tilt, wide),
       },
     ];
 
