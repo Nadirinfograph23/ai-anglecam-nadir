@@ -95,6 +95,19 @@ const GENERATION_DEFAULTS = {
   height: 1024,
 };
 
+// ===== Timeout Helper =====
+const PUTER_TIMEOUT_MS = 30000; // 30s timeout per model attempt
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timeout: " + label + " took longer than " + (ms / 1000) + "s")), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 // ===== Angle Conversion Helpers =====
 function clampRotate(deg: number): number {
   deg = deg % 360;
@@ -178,7 +191,11 @@ async function generateSingleAngleFromPuter(
       if (model !== "default") {
         opts.model = model;
       }
-      const imgElement = await puter.ai.txt2img(prompt, opts);
+      const imgElement = await withTimeout(
+        puter.ai.txt2img(prompt, opts),
+        PUTER_TIMEOUT_MS,
+        "Puter.js " + model + " for " + angle.name,
+      );
       console.log("[Puter] Success with model: " + model);
       return await imageElementToBase64(imgElement);
     } catch (e) {
