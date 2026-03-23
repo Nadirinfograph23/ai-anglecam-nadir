@@ -217,10 +217,10 @@ function CameraPreview3D({
     isDragging.current = false;
   }, []);
 
-  const handleCompassClick = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+  const handleCompassClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (!onAngleChange) return;
-    const svg = e.currentTarget;
-    const rect = svg.getBoundingClientRect();
+    const container = e.currentTarget;
+    const rect = container.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
     const dx = e.clientX - cx;
@@ -312,23 +312,131 @@ function CameraPreview3D({
         </div>
       )}
 
-      <div className="absolute bottom-3 right-3 w-14 h-14">
-        <svg viewBox="0 0 48 48" className="w-full h-full cursor-pointer" onClick={handleCompassClick}>
-          <circle cx="24" cy="24" r="20" fill="rgba(0,0,0,0.5)" stroke="rgba(205,255,0,0.3)" strokeWidth="1" />
-          <text x="24" y="10" textAnchor="middle" fill="rgba(205,255,0,0.6)" fontSize="7" fontWeight="bold">N</text>
-          <text x="24" y="42" textAnchor="middle" fill="rgba(205,255,0,0.4)" fontSize="6">S</text>
-          <text x="6" y="26" textAnchor="middle" fill="rgba(205,255,0,0.4)" fontSize="6">W</text>
-          <text x="42" y="26" textAnchor="middle" fill="rgba(205,255,0,0.4)" fontSize="6">E</text>
-          <line
-            x1="24" y1="24"
-            x2={24 + 14 * Math.sin((horizontalAngle * Math.PI) / 180)}
-            y2={24 - 14 * Math.cos((horizontalAngle * Math.PI) / 180)}
-            stroke="#CDFF00"
-            strokeWidth="2"
-            strokeLinecap="round"
+      {/* 3D Cube Compass */}
+      <div className="absolute bottom-4 right-4 w-24 h-24" style={{ perspective: "300px" }}>
+        <div
+          className="relative w-full h-full cursor-pointer"
+          style={{
+            transformStyle: "preserve-3d",
+            transform: "rotateX(-20deg) rotateY(" + horizontalAngle + "deg)",
+            transition: isDragging.current ? "none" : "transform 0.4s ease-out",
+          }}
+          onClick={handleCompassClick}
+        >
+          {/* Front face */}
+          <div
+            className="absolute inset-0 flex items-center justify-center rounded-lg border border-[#CDFF00]/30"
+            style={{
+              transform: "translateZ(48px)",
+              background: "linear-gradient(135deg, rgba(205,255,0,0.12) 0%, rgba(0,0,0,0.7) 100%)",
+              backfaceVisibility: "hidden",
+            }}
+          >
+            <span className="text-[#CDFF00] font-bold text-lg tracking-wider drop-shadow-[0_0_8px_rgba(205,255,0,0.6)]">N</span>
+          </div>
+          {/* Back face */}
+          <div
+            className="absolute inset-0 flex items-center justify-center rounded-lg border border-[#CDFF00]/20"
+            style={{
+              transform: "rotateY(180deg) translateZ(48px)",
+              background: "linear-gradient(135deg, rgba(205,255,0,0.06) 0%, rgba(0,0,0,0.7) 100%)",
+              backfaceVisibility: "hidden",
+            }}
+          >
+            <span className="text-[#CDFF00]/60 font-bold text-lg tracking-wider">S</span>
+          </div>
+          {/* Right face */}
+          <div
+            className="absolute inset-0 flex items-center justify-center rounded-lg border border-[#CDFF00]/20"
+            style={{
+              transform: "rotateY(90deg) translateZ(48px)",
+              background: "linear-gradient(135deg, rgba(205,255,0,0.08) 0%, rgba(0,0,0,0.7) 100%)",
+              backfaceVisibility: "hidden",
+            }}
+          >
+            <span className="text-[#CDFF00]/50 font-bold text-lg tracking-wider">E</span>
+          </div>
+          {/* Left face */}
+          <div
+            className="absolute inset-0 flex items-center justify-center rounded-lg border border-[#CDFF00]/20"
+            style={{
+              transform: "rotateY(-90deg) translateZ(48px)",
+              background: "linear-gradient(135deg, rgba(205,255,0,0.08) 0%, rgba(0,0,0,0.7) 100%)",
+              backfaceVisibility: "hidden",
+            }}
+          >
+            <span className="text-[#CDFF00]/50 font-bold text-lg tracking-wider">W</span>
+          </div>
+          {/* Top face */}
+          <div
+            className="absolute inset-0 rounded-lg border border-[#CDFF00]/30"
+            style={{
+              transform: "rotateX(90deg) translateZ(48px)",
+              background: "radial-gradient(circle, rgba(205,255,0,0.15) 0%, rgba(0,0,0,0.5) 70%)",
+              backfaceVisibility: "hidden",
+            }}
+          >
+            {/* Compass needle on top face */}
+            <svg viewBox="0 0 96 96" className="w-full h-full">
+              {/* Outer ring */}
+              <circle cx="48" cy="48" r="38" fill="none" stroke="rgba(205,255,0,0.2)" strokeWidth="1" />
+              <circle cx="48" cy="48" r="28" fill="none" stroke="rgba(205,255,0,0.1)" strokeWidth="0.5" strokeDasharray="3 3" />
+              {/* Tick marks */}
+              {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => (
+                <line
+                  key={deg}
+                  x1={48 + 32 * Math.sin((deg * Math.PI) / 180)}
+                  y1={48 - 32 * Math.cos((deg * Math.PI) / 180)}
+                  x2={48 + 38 * Math.sin((deg * Math.PI) / 180)}
+                  y2={48 - 38 * Math.cos((deg * Math.PI) / 180)}
+                  stroke={deg % 90 === 0 ? "rgba(205,255,0,0.6)" : "rgba(205,255,0,0.25)"}
+                  strokeWidth={deg % 90 === 0 ? "2" : "1"}
+                  strokeLinecap="round"
+                />
+              ))}
+              {/* Needle glow */}
+              <line
+                x1="48" y1="48"
+                x2="48" y2="14"
+                stroke="rgba(205,255,0,0.3)"
+                strokeWidth="6"
+                strokeLinecap="round"
+              />
+              {/* Needle */}
+              <line
+                x1="48" y1="48"
+                x2="48" y2="14"
+                stroke="#CDFF00"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+              />
+              {/* Needle tail */}
+              <line
+                x1="48" y1="48"
+                x2="48" y2="72"
+                stroke="rgba(205,255,0,0.3)"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+              />
+              {/* Center dot with glow */}
+              <circle cx="48" cy="48" r="4" fill="#CDFF00" opacity="0.3" />
+              <circle cx="48" cy="48" r="2.5" fill="#CDFF00" />
+            </svg>
+          </div>
+          {/* Bottom face */}
+          <div
+            className="absolute inset-0 rounded-lg border border-[#CDFF00]/10"
+            style={{
+              transform: "rotateX(-90deg) translateZ(48px)",
+              background: "rgba(0,0,0,0.8)",
+              backfaceVisibility: "hidden",
+            }}
           />
-          <circle cx="24" cy="24" r="2" fill="#CDFF00" />
-        </svg>
+        </div>
+        {/* Angle label below cube */}
+        <div className="mt-1 text-center text-[10px] font-mono text-[#CDFF00]/70">
+          {horizontalAngle + "\u00B0"}
+        </div>
       </div>
     </div>
   );
