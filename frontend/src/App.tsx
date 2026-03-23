@@ -33,7 +33,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
             <p className="text-gray-400 mb-4">{this.state.error?.message}</p>
             <button
               onClick={() => { this.setState({ hasError: false, error: null }); window.location.reload(); }}
-              className="px-4 py-2 bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors"
+              className="px-4 py-2 bg-[#CDFF00] text-gray-900 rounded-lg hover:bg-[#d8ff33] transition-colors"
             >
               Reload App
             </button>
@@ -233,8 +233,8 @@ function CameraPreview3D({
   return (
     <div
       ref={containerRef}
-      className={"relative w-full aspect-square rounded-2xl overflow-hidden border-2 bg-gray-900/60 " +
-        (onAngleChange ? "border-cyan-700/50 cursor-grab active:cursor-grabbing" : "border-gray-700")}
+      className={"relative w-full aspect-square rounded-2xl overflow-hidden border-2 bg-black/60 " +
+        (onAngleChange ? "border-[#CDFF00]/30 cursor-grab active:cursor-grabbing" : "border-gray-700")}
       style={{ perspective: "800px" }}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
@@ -277,13 +277,13 @@ function CameraPreview3D({
             className="absolute left-[-20%] right-[-20%] h-[60%] bottom-[-30%]"
             style={{
               transform: "rotateX(90deg) translateZ(-1px)",
-              backgroundImage: "linear-gradient(rgba(100, 200, 255, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(100, 200, 255, 0.1) 1px, transparent 1px)",
+              backgroundImage: "linear-gradient(rgba(205, 255, 0, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(205, 255, 0, 0.1) 1px, transparent 1px)",
               backgroundSize: "20% 20%",
             }}
           />
 
           <div
-            className="absolute w-3 h-3 rounded-full bg-cyan-400 shadow-lg shadow-cyan-400/50"
+            className="absolute w-3 h-3 rounded-full bg-[#CDFF00] shadow-lg shadow-[#CDFF00]/50"
             style={{
               top: "-15%",
               left: "50%",
@@ -291,7 +291,7 @@ function CameraPreview3D({
             }}
           />
           <div
-            className="absolute w-0.5 h-8 bg-cyan-400/60"
+            className="absolute w-0.5 h-8 bg-[#CDFF00]/60"
             style={{
               top: "-15%",
               left: "50%",
@@ -302,7 +302,7 @@ function CameraPreview3D({
         </div>
       </div>
 
-      <div className="absolute top-3 left-3 bg-gray-900/80 backdrop-blur-sm rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-400">
+      <div className="absolute top-3 left-3 bg-black/80 backdrop-blur-sm rounded-lg px-2.5 py-1.5 text-xs font-mono text-[#CDFF00]">
         {"H: " + horizontalAngle + "\u00B0 / V: " + verticalAngle + "\u00B0"}
       </div>
 
@@ -314,20 +314,20 @@ function CameraPreview3D({
 
       <div className="absolute bottom-3 right-3 w-14 h-14">
         <svg viewBox="0 0 48 48" className="w-full h-full cursor-pointer" onClick={handleCompassClick}>
-          <circle cx="24" cy="24" r="20" fill="rgba(0,0,0,0.5)" stroke="rgba(100,200,255,0.3)" strokeWidth="1" />
-          <text x="24" y="10" textAnchor="middle" fill="rgba(100,200,255,0.6)" fontSize="7" fontWeight="bold">N</text>
-          <text x="24" y="42" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">S</text>
-          <text x="6" y="26" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">W</text>
-          <text x="42" y="26" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">E</text>
+          <circle cx="24" cy="24" r="20" fill="rgba(0,0,0,0.5)" stroke="rgba(205,255,0,0.3)" strokeWidth="1" />
+          <text x="24" y="10" textAnchor="middle" fill="rgba(205,255,0,0.6)" fontSize="7" fontWeight="bold">N</text>
+          <text x="24" y="42" textAnchor="middle" fill="rgba(205,255,0,0.4)" fontSize="6">S</text>
+          <text x="6" y="26" textAnchor="middle" fill="rgba(205,255,0,0.4)" fontSize="6">W</text>
+          <text x="42" y="26" textAnchor="middle" fill="rgba(205,255,0,0.4)" fontSize="6">E</text>
           <line
             x1="24" y1="24"
             x2={24 + 14 * Math.sin((horizontalAngle * Math.PI) / 180)}
             y2={24 - 14 * Math.cos((horizontalAngle * Math.PI) / 180)}
-            stroke="#22d3ee"
+            stroke="#CDFF00"
             strokeWidth="2"
             strokeLinecap="round"
           />
-          <circle cx="24" cy="24" r="2" fill="#22d3ee" />
+          <circle cx="24" cy="24" r="2" fill="#CDFF00" />
         </svg>
       </div>
     </div>
@@ -359,11 +359,11 @@ function AngleDropdown({
     <div ref={dropdownRef} className="relative">
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center justify-between gap-2 px-4 py-3 rounded-xl bg-gray-800 border border-gray-700 text-white hover:border-cyan-500/50 transition-colors"
+        className="w-full flex items-center justify-between gap-2 px-4 py-3 rounded-xl bg-gray-900 border border-gray-700 text-white hover:border-[#CDFF00]/50 transition-colors"
       >
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-600/20 flex items-center justify-center">
-            <Camera className="h-4 w-4 text-cyan-400" />
+          <div className="w-8 h-8 rounded-lg bg-[#CDFF00]/10 flex items-center justify-center">
+            <Camera className="h-4 w-4 text-[#CDFF00]" />
           </div>
           <div className="text-left">
             <div className="text-sm font-medium">{selectedAngle.name}</div>
@@ -383,12 +383,12 @@ function AngleDropdown({
               onClick={() => { onSelect(angle); setIsOpen(false); }}
               className={"w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors " +
                 (selectedAngle.name === angle.name
-                  ? "bg-cyan-500/10 text-cyan-400"
+                  ? "bg-[#CDFF00]/10 text-[#CDFF00]"
                   : "text-gray-300 hover:bg-gray-700/50"
                 )}
             >
               <div className={"w-6 h-6 rounded-md flex items-center justify-center text-xs font-bold " +
-                (selectedAngle.name === angle.name ? "bg-cyan-500/20 text-cyan-400" : "bg-gray-700 text-gray-400")}>
+                (selectedAngle.name === angle.name ? "bg-[#CDFF00]/20 text-[#CDFF00]" : "bg-gray-700 text-gray-400")}>
                 {angle.name.charAt(0)}
               </div>
               <div>
@@ -509,16 +509,16 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white">
-      <header className="sticky top-0 z-30 w-full border-b border-gray-800/50 bg-gray-950/90 backdrop-blur-xl">
+    <div className="min-h-screen bg-black text-white">
+      <header className="sticky top-0 z-30 w-full border-b border-gray-800/50 bg-black/90 backdrop-blur-xl">
         <div className="max-w-7xl mx-auto px-4 sm:px-6">
           <div className="flex items-center justify-between h-14">
             <div className="flex items-center gap-3">
-              <div className="rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 p-1.5">
-                <Camera className="h-5 w-5 text-white" />
+              <div className="rounded-lg bg-[#CDFF00] p-1.5">
+                <Camera className="h-5 w-5 text-black" />
               </div>
               <div>
-                <h1 className="text-base font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
+                <h1 className="text-base font-bold text-[#CDFF00]">
                   AI AngleCam Nadir
                 </h1>
                 <p className="text-xs text-gray-500 -mt-0.5 hidden sm:block">
@@ -546,7 +546,7 @@ function App() {
           {/* Left Panel - Controls */}
           <div className="space-y-5">
             {/* Upload Section */}
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+            <div className="rounded-2xl bg-gray-950/60 border border-gray-800/50 p-5">
               <div className="flex items-center gap-2 mb-3">
                 <h3 className="text-white font-semibold">Input Image</h3>
                 <span className="text-red-500">*</span>
@@ -556,8 +556,8 @@ function App() {
                   onClick={() => fileInputRef.current?.click()}
                   className={"w-full flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-6 transition-all " + (
                     selectedImage
-                      ? "border-gray-700 bg-gray-800/30 hover:border-cyan-500/50"
-                      : "border-gray-600 bg-gray-800/50 hover:border-cyan-400/50 hover:bg-gray-800"
+                      ? "border-gray-700 bg-gray-900/30 hover:border-[#CDFF00]/50"
+                      : "border-gray-600 bg-gray-900/50 hover:border-[#CDFF00]/50 hover:bg-gray-900"
                   )}
                 >
                   <Upload className="h-8 w-8 text-gray-400" />
@@ -588,7 +588,7 @@ function App() {
             </div>
 
             {/* Angle Selection Dropdown */}
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+            <div className="rounded-2xl bg-gray-950/60 border border-gray-800/50 p-5">
               <h3 className="text-white font-semibold mb-3">Camera Angle</h3>
               <AngleDropdown selectedAngle={selectedAngle} onSelect={setSelectedAngle} />
               <p className="text-xs text-gray-500 mt-2">
@@ -597,7 +597,7 @@ function App() {
             </div>
 
             {/* Lens Type */}
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+            <div className="rounded-2xl bg-gray-950/60 border border-gray-800/50 p-5">
               <h3 className="text-white font-semibold mb-3">Lens Type</h3>
               <div className="flex gap-2">
                 {LENS_OPTIONS.map((opt) => (
@@ -620,7 +620,7 @@ function App() {
             <button
               onClick={generateAngle}
               disabled={!imageFile || isGenerating}
-              className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
+              className="w-full flex items-center justify-center gap-2 rounded-xl bg-[#CDFF00] px-6 py-3.5 text-base font-semibold text-black shadow-lg shadow-[#CDFF00]/20 transition-all hover:bg-[#d8ff33] hover:shadow-[#CDFF00]/30 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
                 <>
@@ -637,9 +637,9 @@ function App() {
 
             {/* Status */}
             {statusMsg && (
-              <div className="rounded-xl bg-blue-900/20 border border-blue-800/30 p-3 flex items-center gap-2">
-                <Loader2 className="h-4 w-4 text-blue-400 animate-spin shrink-0" />
-                <p className="text-blue-300 text-sm">{statusMsg}</p>
+              <div className="rounded-xl bg-[#CDFF00]/5 border border-[#CDFF00]/20 p-3 flex items-center gap-2">
+                <Loader2 className="h-4 w-4 text-[#CDFF00] animate-spin shrink-0" />
+                <p className="text-[#CDFF00]/80 text-sm">{statusMsg}</p>
               </div>
             )}
 
@@ -655,7 +655,7 @@ function App() {
           {/* Right Panel - 3D Preview and Result */}
           <div className="lg:col-span-2 space-y-5">
             {/* 3D Camera Preview */}
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+            <div className="rounded-2xl bg-gray-950/60 border border-gray-800/50 p-5">
               <h3 className="text-white font-semibold mb-3">3D Camera Angle Preview</h3>
               <CameraPreview3D
                 horizontalAngle={selectedAngle.h}
@@ -666,13 +666,13 @@ function App() {
             </div>
 
             {/* Generated Result */}
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+            <div className="rounded-2xl bg-gray-950/60 border border-gray-800/50 p-5">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-white font-semibold">Generated Result</h3>
                 {resultImage && (
                   <button
                     onClick={downloadImage}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-gradient-to-r from-blue-600 to-cyan-600 text-white hover:from-blue-500 hover:to-cyan-500 transition-colors"
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-[#CDFF00] text-black hover:bg-[#d8ff33] transition-colors"
                   >
                     <Download className="h-3.5 w-3.5" />
                     Download
@@ -687,13 +687,13 @@ function App() {
                     alt={"Generated " + selectedAngle.name + " view"}
                     className="w-full h-auto max-h-[600px] object-contain"
                   />
-                  <div className="absolute bottom-3 left-3 bg-gray-900/80 backdrop-blur-sm rounded-lg px-3 py-1.5 text-xs text-cyan-400 font-medium">
+                  <div className="absolute bottom-3 left-3 bg-black/80 backdrop-blur-sm rounded-lg px-3 py-1.5 text-xs text-[#CDFF00] font-medium">
                     {selectedAngle.name + " (" + selectedAngle.h + "\u00B0, " + selectedAngle.v + "\u00B0)"}
                   </div>
                 </div>
               ) : isGenerating ? (
                 <div className="flex flex-col items-center justify-center h-64 text-gray-600">
-                  <Loader2 className="h-12 w-12 animate-spin text-blue-500 mb-4" />
+                  <Loader2 className="h-12 w-12 animate-spin text-[#CDFF00] mb-4" />
                   <p className="text-gray-400 font-medium">Generating angle view...</p>
                   <p className="text-gray-500 text-sm mt-1">{statusMsg || "Please wait..."}</p>
                 </div>
