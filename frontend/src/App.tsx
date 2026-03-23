@@ -1,15 +1,14 @@
-import { useState, useRef, useCallback, useMemo, Component, type ReactNode, type ErrorInfo } from "react";
+import { useState, useRef, useCallback, useEffect, Component, type ReactNode, type ErrorInfo } from "react";
 import {
   Camera,
   Upload,
   Download,
-  RotateCcw,
   Loader2,
   AlertCircle,
-  CheckCircle2,
   ImageIcon,
   Sparkles,
   X,
+  ChevronDown,
 } from "lucide-react";
 
 // Error Boundary for graceful error handling
@@ -46,8 +45,22 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-// ===== HuggingFace Gradio Space Configuration =====
-const HF_SPACE_URL = "https://linoyts-qwen-image-edit-angles.hf.space";
+// ===== Multiple HuggingFace Space URLs for failover =====
+const HF_SPACE_URLS = [
+  "https://linoyts-qwen-image-edit-angles.hf.space",
+  "https://linoyts-qwen2-5-image-edit.hf.space",
+];
+
+let currentSpaceIndex = 0;
+
+function getNextSpaceUrl(): string {
+  currentSpaceIndex = (currentSpaceIndex + 1) % HF_SPACE_URLS.length;
+  return HF_SPACE_URLS[currentSpaceIndex];
+}
+
+function getCurrentSpaceUrl(): string {
+  return HF_SPACE_URLS[currentSpaceIndex];
+}
 
 const PREDEFINED_ANGLES = [
   { name: "Front", h: 0, v: 0 },
@@ -59,6 +72,9 @@ const PREDEFINED_ANGLES = [
   { name: "Left", h: -90, v: 0 },
   { name: "Front Left", h: -45, v: 0 },
   { name: "Top View", h: 0, v: 60 },
+  { name: "Low Angle", h: 0, v: -30 },
+  { name: "Bird Eye 45", h: 45, v: 45 },
+  { name: "Dutch Angle", h: 30, v: 15 },
 ];
 
 const GENERATION_DEFAULTS = {
@@ -117,8 +133,8 @@ async function optimizeImage(file: File, maxSize = 2048): Promise<Blob> {
   });
 }
 
-// ===== HuggingFace Gradio API Client =====
-async function uploadToHF(imageBlob: Blob): Promise<string> {
+// ===== HuggingFace Gradio API Client with failover =====
+async function uploadToHF(imageBlob: Blob, spaceUrl: string): Promise<string> {
   const formData = new FormData();
   formData.append("files", imageBlob, "input.png");
 
@@ -126,7 +142,7 @@ async function uploadToHF(imageBlob: Blob): Promise<string> {
   const timeout = setTimeout(() => controller.abort(), 60000);
 
   try {
-    const response = await fetch(HF_SPACE_URL + "/gradio_api/upload", {
+    const response = await fetch(spaceUrl + "/gradio_api/upload", {
       method: "POST",
       body: formData,
       signal: controller.signal,
@@ -194,6 +210,7 @@ async function generateSingleAngleFromHF(
   moveForward: number,
   verticalTilt: number,
   wideangle: boolean,
+  spaceUrl: string,
 ): Promise<{ imageData: string; contentType: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
@@ -217,7 +234,7 @@ async function generateSingleAngleFromHF(
       ],
     };
 
-    const submitResponse = await fetch(HF_SPACE_URL + "/gradio_api/call/maybe_infer", {
+    const submitResponse = await fetch(spaceUrl + "/gradio_api/call/maybe_infer", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -234,7 +251,7 @@ async function generateSingleAngleFromHF(
     if (!eventId) throw new Error("No event_id in API response");
 
     const resultResponse = await fetch(
-      HF_SPACE_URL + "/gradio_api/call/maybe_infer/" + eventId,
+      spaceUrl + "/gradio_api/call/maybe_infer/" + eventId,
       { signal: controller.signal }
     );
 
@@ -260,73 +277,247 @@ async function generateSingleAngleFromHF(
   }
 }
 
-async function withRetry<T>(
-  fn: () => Promise<T>,
+/** Retry with failover across multiple HF Space endpoints */
+async function withFailoverRetry(
+  fn: (spaceUrl: string) => Promise<{ imageData: string; contentType: string }>,
   maxRetries = 3,
-  baseDelay = 3000,
+  baseDelay = 2000,
   label = "",
-): Promise<T> {
+): Promise<{ imageData: string; contentType: string }> {
   let lastError: Error | null = null;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  const totalAttempts = maxRetries * HF_SPACE_URLS.length;
+
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    const spaceUrl = getCurrentSpaceUrl();
     try {
-      return await fn();
+      return await fn(spaceUrl);
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn("[HF] " + label + " attempt " + (attempt + 1) + "/" + maxRetries + " failed:", lastError.message);
-      if (attempt < maxRetries - 1) {
-        const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
+      console.warn(
+        "[HF] " + label + " attempt " + (attempt + 1) + "/" + totalAttempts +
+        " failed on " + spaceUrl + ":", lastError.message
+      );
+      getNextSpaceUrl();
+      if (attempt < totalAttempts - 1) {
+        const delay = Math.min(baseDelay * Math.pow(1.5, attempt % maxRetries), 15000);
         await new Promise((r) => setTimeout(r, delay));
       }
     }
   }
-  throw lastError || new Error(label + " failed after " + maxRetries + " attempts");
+  throw lastError || new Error(label + " failed after " + totalAttempts + " attempts");
 }
 
-// ===== React Types and Constants =====
-interface AngleResult {
-  name: string;
-  success: boolean;
-  image_data?: string;
-  content_type?: string;
-  error?: string;
+/** Upload with failover across endpoints */
+async function uploadWithFailover(imageBlob: Blob): Promise<{ path: string; spaceUrl: string }> {
+  let lastError: Error | null = null;
+  for (let i = 0; i < HF_SPACE_URLS.length * 2; i++) {
+    const spaceUrl = getCurrentSpaceUrl();
+    try {
+      const path = await uploadToHF(imageBlob, spaceUrl);
+      return { path, spaceUrl };
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      console.warn("[HF] Upload failed on " + spaceUrl + ":", lastError.message);
+      getNextSpaceUrl();
+      if (i < HF_SPACE_URLS.length * 2 - 1) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+  }
+  throw lastError || new Error("Upload failed on all endpoints");
 }
 
-interface PendingAngle {
-  name: string;
-  success: false;
-  pending: true;
+// ===== 3D Camera Preview Component =====
+function CameraPreview3D({
+  horizontalAngle,
+  verticalAngle,
+  imageSrc,
+}: {
+  horizontalAngle: number;
+  verticalAngle: number;
+  imageSrc: string | null;
+}) {
+  const rotateY = -horizontalAngle;
+  const rotateX = verticalAngle * 0.5;
+
+  return (
+    <div
+      className="relative w-full aspect-square rounded-2xl overflow-hidden border-2 border-gray-700 bg-gray-900/60"
+      style={{ perspective: "800px" }}
+    >
+      <div className="absolute inset-0 flex items-center justify-center">
+        <div
+          className="w-[70%] h-[70%] relative"
+          style={{
+            transformStyle: "preserve-3d",
+            transform: "rotateX(" + (20 + rotateX) + "deg) rotateY(" + rotateY + "deg)",
+            transition: "transform 0.4s ease-out",
+          }}
+        >
+          {imageSrc ? (
+            <div
+              className="absolute inset-0 rounded-xl overflow-hidden shadow-2xl"
+              style={{
+                backfaceVisibility: "hidden",
+                transform: "translateZ(1px)",
+              }}
+            >
+              <img src={imageSrc} alt="Preview" className="w-full h-full object-cover" />
+              <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent" />
+            </div>
+          ) : (
+            <div
+              className="absolute inset-0 rounded-xl border-2 border-dashed border-gray-600 flex items-center justify-center bg-gray-800/50"
+              style={{
+                backfaceVisibility: "hidden",
+                transform: "translateZ(1px)",
+              }}
+            >
+              <ImageIcon className="h-12 w-12 text-gray-600" />
+            </div>
+          )}
+
+          <div
+            className="absolute left-[-20%] right-[-20%] h-[60%] bottom-[-30%]"
+            style={{
+              transform: "rotateX(90deg) translateZ(-1px)",
+              backgroundImage: "linear-gradient(rgba(100, 200, 255, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(100, 200, 255, 0.1) 1px, transparent 1px)",
+              backgroundSize: "20% 20%",
+            }}
+          />
+
+          <div
+            className="absolute w-3 h-3 rounded-full bg-cyan-400 shadow-lg shadow-cyan-400/50"
+            style={{
+              top: "-15%",
+              left: "50%",
+              transform: "translateX(-50%) translateZ(40px)",
+            }}
+          />
+          <div
+            className="absolute w-0.5 h-8 bg-cyan-400/60"
+            style={{
+              top: "-15%",
+              left: "50%",
+              transform: "translateX(-50%) translateZ(20px) rotateX(-30deg)",
+              transformOrigin: "top center",
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="absolute top-3 left-3 bg-gray-900/80 backdrop-blur-sm rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-400">
+        {"H: " + horizontalAngle + "\u00B0 / V: " + verticalAngle + "\u00B0"}
+      </div>
+
+      <div className="absolute bottom-3 right-3 w-12 h-12">
+        <svg viewBox="0 0 48 48" className="w-full h-full">
+          <circle cx="24" cy="24" r="20" fill="rgba(0,0,0,0.5)" stroke="rgba(100,200,255,0.3)" strokeWidth="1" />
+          <text x="24" y="10" textAnchor="middle" fill="rgba(100,200,255,0.6)" fontSize="7" fontWeight="bold">N</text>
+          <text x="24" y="42" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">S</text>
+          <text x="6" y="26" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">W</text>
+          <text x="42" y="26" textAnchor="middle" fill="rgba(100,200,255,0.4)" fontSize="6">E</text>
+          <line
+            x1="24" y1="24"
+            x2={24 + 14 * Math.sin((horizontalAngle * Math.PI) / 180)}
+            y2={24 - 14 * Math.cos((horizontalAngle * Math.PI) / 180)}
+            stroke="#22d3ee"
+            strokeWidth="2"
+            strokeLinecap="round"
+          />
+          <circle cx="24" cy="24" r="2" fill="#22d3ee" />
+        </svg>
+      </div>
+    </div>
+  );
 }
 
-type GridItem = AngleResult | PendingAngle;
+// ===== Dropdown Component =====
+function AngleDropdown({
+  selectedAngle,
+  onSelect,
+}: {
+  selectedAngle: typeof PREDEFINED_ANGLES[0];
+  onSelect: (angle: typeof PREDEFINED_ANGLES[0]) => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
-const ANGLE_NAMES = [
-  "Front", "Front Right", "Right", "Back Right", "Back",
-  "Back Left", "Left", "Front Left", "Top View",
-];
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
-const LENS_OPTIONS = [
-  { value: "normal", label: "Normal" },
-  { value: "wide", label: "Wide Angle" },
-  { value: "closeup", label: "Close-Up" },
-];
+  return (
+    <div ref={dropdownRef} className="relative">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full flex items-center justify-between gap-2 px-4 py-3 rounded-xl bg-gray-800 border border-gray-700 text-white hover:border-cyan-500/50 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-600/20 flex items-center justify-center">
+            <Camera className="h-4 w-4 text-cyan-400" />
+          </div>
+          <div className="text-left">
+            <div className="text-sm font-medium">{selectedAngle.name}</div>
+            <div className="text-xs text-gray-400">
+              {"H: " + selectedAngle.h + "\u00B0 / V: " + selectedAngle.v + "\u00B0"}
+            </div>
+          </div>
+        </div>
+        <ChevronDown className={"h-4 w-4 text-gray-400 transition-transform " + (isOpen ? "rotate-180" : "")} />
+      </button>
 
-function isPending(item: GridItem): item is PendingAngle {
-  return "pending" in item && item.pending === true;
+      {isOpen && (
+        <div className="absolute z-50 w-full mt-2 py-1 rounded-xl bg-gray-800 border border-gray-700 shadow-xl shadow-black/50 max-h-72 overflow-y-auto">
+          {PREDEFINED_ANGLES.map((angle) => (
+            <button
+              key={angle.name}
+              onClick={() => { onSelect(angle); setIsOpen(false); }}
+              className={"w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors " +
+                (selectedAngle.name === angle.name
+                  ? "bg-cyan-500/10 text-cyan-400"
+                  : "text-gray-300 hover:bg-gray-700/50"
+                )}
+            >
+              <div className={"w-6 h-6 rounded-md flex items-center justify-center text-xs font-bold " +
+                (selectedAngle.name === angle.name ? "bg-cyan-500/20 text-cyan-400" : "bg-gray-700 text-gray-400")}>
+                {angle.name.charAt(0)}
+              </div>
+              <div>
+                <div className="text-sm font-medium">{angle.name}</div>
+                <div className="text-xs text-gray-500">{"H: " + angle.h + "\u00B0 / V: " + angle.v + "\u00B0"}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
+// ===== Main App =====
 function App() {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [imageFile, setImageFile] = useState<File | null>(null);
+  const [selectedAngle, setSelectedAngle] = useState(PREDEFINED_ANGLES[0]);
   const [lens, setLens] = useState("normal");
   const [isGenerating, setIsGenerating] = useState(false);
-  const [results, setResults] = useState<AngleResult[]>([]);
-  const [progress, setProgress] = useState({ completed: 0, total: 9 });
+  const [resultImage, setResultImage] = useState<{ imageData: string; contentType: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [retryingAngle, setRetryingAngle] = useState<string | null>(null);
-  const [retryingAll, setRetryingAll] = useState(false);
-  const [imageCount, setImageCount] = useState<number | null>(null);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const uploadedPathRef = useRef<string | null>(null);
+
+  const LENS_OPTIONS = [
+    { value: "normal", label: "Normal" },
+    { value: "wide", label: "Wide Angle" },
+    { value: "closeup", label: "Close-Up" },
+  ];
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -339,8 +530,7 @@ function App() {
     }
     setImageFile(file);
     setError(null);
-    setResults([]);
-    uploadedPathRef.current = null;
+    setResultImage(null);
     const reader = new FileReader();
     reader.onload = (e) => setSelectedImage(e.target?.result as string);
     reader.readAsDataURL(file);
@@ -355,207 +545,56 @@ function App() {
     [handleFileSelect]
   );
 
-  const selectedAngleCount = imageCount || 9;
-
-  const generateAllAngles = async () => {
-    if (!imageFile || !imageCount) return;
+  const generateAngle = async () => {
+    if (!imageFile) return;
     setIsGenerating(true);
     setError(null);
-    setResults([]);
-    const total = imageCount;
-    setProgress({ completed: 0, total });
+    setResultImage(null);
+    setStatusMsg("Optimizing image...");
 
     try {
       const optimized = await optimizeImage(imageFile);
-      const uploadedPath = await withRetry(
-        () => uploadToHF(optimized),
-        3, 3000, "Upload"
-      );
-      uploadedPathRef.current = uploadedPath;
+      setStatusMsg("Uploading to AI server...");
 
+      const { path: uploadedPath, spaceUrl } = await uploadWithFailover(optimized);
+
+      const rotate = clampRotate(selectedAngle.h);
       const forward = convertForward(lens);
+      const tilt = convertVertical(selectedAngle.v);
       const isWide = lens === "wide";
-      let completedCount = 0;
-      const anglesToGenerate = PREDEFINED_ANGLES.slice(0, total);
 
-      const batchSize = 2;
-      for (let i = 0; i < anglesToGenerate.length; i += batchSize) {
-        const batch = anglesToGenerate.slice(i, i + batchSize);
+      setStatusMsg("Generating " + selectedAngle.name + " view...");
 
-        const batchPromises = batch.map(async (angle) => {
-          const rotate = clampRotate(angle.h);
-          const tilt = convertVertical(angle.v);
-
-          try {
-            const result = await withRetry(
-              () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-              4, 3000, angle.name
-            );
-            completedCount++;
-            setProgress({ completed: completedCount, total });
-            setResults((prev) => [
-              ...prev.filter((r) => r.name !== angle.name),
-              {
-                name: angle.name,
-                success: true,
-                image_data: result.imageData,
-                content_type: result.contentType,
-              },
-            ]);
-          } catch (e) {
-            completedCount++;
-            setProgress({ completed: completedCount, total });
-            setResults((prev) => [
-              ...prev.filter((r) => r.name !== angle.name),
-              {
-                name: angle.name,
-                success: false,
-                error: e instanceof Error ? e.message : "Generation failed",
-              },
-            ]);
+      const result = await withFailoverRetry(
+        async (currentUrl) => {
+          let finalPath = uploadedPath;
+          if (currentUrl !== spaceUrl) {
+            setStatusMsg("Re-uploading to backup server...");
+            finalPath = await uploadToHF(optimized, currentUrl);
           }
-        });
+          return generateSingleAngleFromHF(finalPath, rotate, forward, tilt, isWide, currentUrl);
+        },
+        3, 2000, selectedAngle.name
+      );
 
-        await Promise.all(batchPromises);
-
-        if (i + batchSize < anglesToGenerate.length) {
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-      }
+      setResultImage(result);
+      setStatusMsg(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Generation failed. Please try again.");
+      setStatusMsg(null);
     } finally {
       setIsGenerating(false);
     }
   };
 
-  const retryAngle = async (angleName: string) => {
-    if (!imageFile) return;
-    setRetryingAngle(angleName);
-    setError(null);
-
-    try {
-      const angle = PREDEFINED_ANGLES.find((a) => a.name === angleName);
-      if (!angle) throw new Error("Unknown angle: " + angleName);
-
-      let uploadedPath = uploadedPathRef.current;
-      if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
-        uploadedPathRef.current = uploadedPath;
-      }
-
-      const rotate = clampRotate(angle.h);
-      const forward = convertForward(lens);
-      const tilt = convertVertical(angle.v);
-      const isWide = lens === "wide";
-
-      const result = await withRetry(
-        () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-        4, 2000, angleName
-      );
-
-      setResults((prev) => [
-        ...prev.filter((r) => r.name !== angleName),
-        {
-          name: angleName,
-          success: true,
-          image_data: result.imageData,
-          content_type: result.contentType,
-        },
-      ]);
-    } catch (e) {
-      setError("Retry for " + angleName + " failed: " + (e instanceof Error ? e.message : "Unknown error"));
-    } finally {
-      setRetryingAngle(null);
-    }
-  };
-
-  const retryAllFailed = async () => {
-    if (!imageFile) return;
-    const failedResults = results.filter((r) => !r.success);
-    if (failedResults.length === 0) return;
-    setRetryingAll(true);
-    setError(null);
-
-    try {
-      let uploadedPath = uploadedPathRef.current;
-      if (!uploadedPath) {
-        const optimized = await optimizeImage(imageFile);
-        uploadedPath = await withRetry(() => uploadToHF(optimized), 3, 3000, "Upload");
-        uploadedPathRef.current = uploadedPath;
-      }
-
-      const forward = convertForward(lens);
-      const isWide = lens === "wide";
-
-      for (const failed of failedResults) {
-        const angle = PREDEFINED_ANGLES.find((a) => a.name === failed.name);
-        if (!angle) continue;
-
-        try {
-          const rotate = clampRotate(angle.h);
-          const tilt = convertVertical(angle.v);
-
-          const result = await withRetry(
-            () => generateSingleAngleFromHF(uploadedPath, rotate, forward, tilt, isWide),
-            3, 4000, failed.name
-          );
-
-          setResults((prev) => [
-            ...prev.filter((r) => r.name !== failed.name),
-            {
-              name: failed.name,
-              success: true,
-              image_data: result.imageData,
-              content_type: result.contentType,
-            },
-          ]);
-        } catch {
-          // Continue with next angle
-        }
-      }
-    } catch (e) {
-      setError("Retry failed: " + (e instanceof Error ? e.message : "Unknown error"));
-    } finally {
-      setRetryingAll(false);
-    }
-  };
-
-  const downloadImage = (result: AngleResult) => {
-    if (!result.image_data || !result.content_type) return;
-    const ext = result.content_type.includes("webp") ? "webp" : "png";
+  const downloadImage = () => {
+    if (!resultImage) return;
+    const ext = resultImage.contentType.includes("webp") ? "webp" : "png";
     const link = document.createElement("a");
-    link.href = "data:" + result.content_type + ";base64," + result.image_data;
-    link.download = "angle-" + result.name.toLowerCase().replace(/\s+/g, "-") + "." + ext;
+    link.href = "data:" + resultImage.contentType + ";base64," + resultImage.imageData;
+    link.download = "angle-" + selectedAngle.name.toLowerCase().replace(/\s+/g, "-") + "." + ext;
     link.click();
   };
-
-  const downloadAll = () => {
-    const successResults = results.filter((r) => r.success);
-    successResults.forEach((r, i) => {
-      setTimeout(() => downloadImage(r), i * 300);
-    });
-  };
-
-  const successCount = useMemo(() => results.filter((r) => r.success).length, [results]);
-  const failCount = useMemo(() => results.filter((r) => !r.success).length, [results]);
-
-  const activeAngleNames = useMemo(() => ANGLE_NAMES.slice(0, selectedAngleCount), [selectedAngleCount]);
-
-  const getGridItems = useCallback((): GridItem[] => {
-    if (isGenerating) {
-      return activeAngleNames.map((name) => {
-        const existing = results.find((r) => r.name === name);
-        if (existing) return existing;
-        return { name, success: false as const, pending: true as const };
-      });
-    }
-    // Show all results (successful and failed) so user can retry failed ones
-    return activeAngleNames
-      .map((name) => results.find((r) => r.name === name))
-      .filter((r): r is AngleResult => r !== undefined);
-  }, [isGenerating, results, activeAngleNames]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -571,7 +610,7 @@ function App() {
                   AI AngleCam Nadir
                 </h1>
                 <p className="text-xs text-gray-500 -mt-0.5 hidden sm:block">
-                  Multi-Angle Image Generator
+                  AI Camera Angle Generator
                 </p>
               </div>
             </div>
@@ -585,14 +624,16 @@ function App() {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
         <div className="mb-6">
-          <h2 className="text-2xl font-bold text-white">Generate Multi-Angle Views</h2>
+          <h2 className="text-2xl font-bold text-white">Generate Camera Angle View</h2>
           <p className="text-gray-400 text-sm mt-1">
-            Upload an image and generate 9 different viewing angles automatically
+            Upload an image, choose a camera angle, and generate a new perspective instantly
           </p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left Panel - Controls */}
           <div className="space-y-5">
+            {/* Upload Section */}
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
               <div className="flex items-center gap-2 mb-3">
                 <h3 className="text-white font-semibold">Input Image</h3>
@@ -615,9 +656,9 @@ function App() {
                 </button>
                 {selectedImage && (
                   <div className="relative rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
-                    <img src={selectedImage} alt="Input preview" className="w-full h-auto max-h-64 object-contain" />
+                    <img src={selectedImage} alt="Input preview" className="w-full h-auto max-h-48 object-contain" />
                     <button
-                      onClick={() => { setSelectedImage(null); setImageFile(null); setResults([]); }}
+                      onClick={() => { setSelectedImage(null); setImageFile(null); setResultImage(null); }}
                       className="absolute top-2 right-2 p-1 rounded-full bg-gray-900/80 hover:bg-red-600 transition-colors"
                     >
                       <X className="h-4 w-4" />
@@ -634,6 +675,13 @@ function App() {
               </div>
             </div>
 
+            {/* Angle Selection Dropdown */}
+            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+              <h3 className="text-white font-semibold mb-3">Camera Angle</h3>
+              <AngleDropdown selectedAngle={selectedAngle} onSelect={setSelectedAngle} />
+            </div>
+
+            {/* Lens Type */}
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
               <h3 className="text-white font-semibold mb-3">Lens Type</h3>
               <div className="flex gap-2">
@@ -653,182 +701,91 @@ function App() {
               </div>
             </div>
 
-            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
-              <div className="flex items-center gap-2 mb-3">
-                <h3 className="text-white font-semibold">Number of Images</h3>
-                <span className="text-red-500">*</span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {[3, 4, 5, 6, 7, 8, 9].map((count) => (
-                  <button
-                    key={count}
-                    onClick={() => setImageCount(count)}
-                    className={"px-4 py-2 rounded-lg text-sm font-medium transition-all min-w-[3rem] " + (
-                      imageCount === count
-                        ? "bg-white text-gray-900"
-                        : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700"
-                    )}
-                  >
-                    {count}
-                  </button>
-                ))}
-              </div>
-              {!imageCount && (
-                <p className="text-amber-400 text-xs mt-2 flex items-center gap-1">
-                  <AlertCircle className="h-3 w-3" />
-                  Please select the number of images to generate
-                </p>
-              )}
-            </div>
-
+            {/* Generate Button */}
             <button
-              onClick={generateAllAngles}
-              disabled={!imageFile || !imageCount || isGenerating}
+              onClick={generateAngle}
+              disabled={!imageFile || isGenerating}
               className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:shadow-blue-500/30 hover:from-blue-500 hover:to-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  {"Generating... (" + progress.completed + "/" + progress.total + ")"}
+                  Generating...
                 </>
               ) : (
                 <>
                   <Sparkles className="h-5 w-5" />
-                  {imageCount ? "Generate " + imageCount + " Angles" : "Generate Angles"}
+                  Generate Angle View
                 </>
               )}
             </button>
 
-            {isGenerating && (
-              <div className="rounded-xl bg-gray-800 p-3">
-                <div className="w-full bg-gray-700 rounded-full h-2">
-                  <div
-                    className="bg-gradient-to-r from-blue-500 to-cyan-500 h-2 rounded-full transition-all duration-500"
-                    style={{ width: ((progress.completed / progress.total) * 100) + "%" }}
-                  />
-                </div>
-                <p className="text-center text-gray-400 text-xs mt-2">
-                  {progress.completed + "/" + progress.total + " angles completed"}
-                </p>
+            {/* Status */}
+            {statusMsg && (
+              <div className="rounded-xl bg-blue-900/20 border border-blue-800/30 p-3 flex items-center gap-2">
+                <Loader2 className="h-4 w-4 text-blue-400 animate-spin shrink-0" />
+                <p className="text-blue-300 text-sm">{statusMsg}</p>
               </div>
             )}
 
+            {/* Error */}
             {error && (
               <div className="rounded-xl bg-red-900/30 border border-red-800/50 p-3 flex items-start gap-2">
                 <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 shrink-0" />
                 <p className="text-red-300 text-sm">{error}</p>
               </div>
             )}
-
-            {results.length > 0 && !isGenerating && (
-              <div className="space-y-2">
-                <div className="rounded-xl bg-gray-800/50 p-3 flex items-center justify-between text-sm">
-                  <div className="flex items-center gap-4">
-                    <span className="flex items-center gap-1 text-green-400">
-                      <CheckCircle2 className="h-4 w-4" />
-                      {successCount + " succeeded"}
-                    </span>
-                    {failCount > 0 && (
-                      <span className="flex items-center gap-1 text-red-400">
-                        <AlertCircle className="h-4 w-4" />
-                        {failCount + " failed"}
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {failCount > 0 && (
-                      <button
-                        onClick={retryAllFailed}
-                        disabled={retryingAll}
-                        className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-orange-600/80 text-white hover:bg-orange-500 transition-colors disabled:opacity-50"
-                      >
-                        {retryingAll ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <RotateCcw className="h-3.5 w-3.5" />
-                        )}
-                        Retry Failed
-                      </button>
-                    )}
-                    {successCount > 0 && (
-                      <button
-                        onClick={downloadAll}
-                        className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-gradient-to-r from-blue-600 to-cyan-600 text-white hover:from-blue-500 hover:to-cyan-500 transition-colors"
-                      >
-                        <Download className="h-3.5 w-3.5" />
-                        Download All
-                      </button>
-                    )}
-                  </div>
-                </div>
-                {failCount > 0 && (
-                  <div className="rounded-xl bg-amber-900/30 border border-amber-700/40 p-3 flex items-start gap-2">
-                    <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
-                    <p className="text-amber-300 text-sm">
-                      {"Some angles failed due to server load. Click 'Retry Failed' to try again."}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
           </div>
 
-          <div className="lg:col-span-2">
+          {/* Right Panel - 3D Preview and Result */}
+          <div className="lg:col-span-2 space-y-5">
+            {/* 3D Camera Preview */}
+            <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
+              <h3 className="text-white font-semibold mb-3">3D Camera Angle Preview</h3>
+              <CameraPreview3D
+                horizontalAngle={selectedAngle.h}
+                verticalAngle={selectedAngle.v}
+                imageSrc={selectedImage}
+              />
+            </div>
+
+            {/* Generated Result */}
             <div className="rounded-2xl bg-gray-900/60 border border-gray-800/50 p-5">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-white font-semibold">
-                  {"Generated Angles" + (results.length > 0 ? " (" + successCount + "/" + selectedAngleCount + ")" : "")}
-                </h3>
+                <h3 className="text-white font-semibold">Generated Result</h3>
+                {resultImage && (
+                  <button
+                    onClick={downloadImage}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-gradient-to-r from-blue-600 to-cyan-600 text-white hover:from-blue-500 hover:to-cyan-500 transition-colors"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Download
+                  </button>
+                )}
               </div>
 
-              {results.length === 0 && !isGenerating ? (
-                <div className="flex flex-col items-center justify-center h-96 text-gray-600">
-                  <ImageIcon className="h-16 w-16 mb-4 opacity-30" />
-                  <p className="text-gray-400 font-medium">No images generated yet</p>
-                  <p className="text-gray-500 text-sm mt-1">Upload an image and click Generate to start</p>
+              {resultImage ? (
+                <div className="rounded-xl overflow-hidden bg-gray-800 group relative">
+                  <img
+                    src={"data:" + resultImage.contentType + ";base64," + resultImage.imageData}
+                    alt={"Generated " + selectedAngle.name + " view"}
+                    className="w-full h-auto max-h-[600px] object-contain"
+                  />
+                  <div className="absolute bottom-3 left-3 bg-gray-900/80 backdrop-blur-sm rounded-lg px-3 py-1.5 text-xs text-cyan-400 font-medium">
+                    {selectedAngle.name + " (" + selectedAngle.h + "\u00B0, " + selectedAngle.v + "\u00B0)"}
+                  </div>
+                </div>
+              ) : isGenerating ? (
+                <div className="flex flex-col items-center justify-center h-64 text-gray-600">
+                  <Loader2 className="h-12 w-12 animate-spin text-blue-500 mb-4" />
+                  <p className="text-gray-400 font-medium">Generating angle view...</p>
+                  <p className="text-gray-500 text-sm mt-1">{statusMsg || "Please wait..."}</p>
                 </div>
               ) : (
-                <div className="grid grid-cols-3 gap-3">
-                  {getGridItems().map((item) => (
-                    <div key={item.name} className="rounded-xl overflow-hidden bg-gray-800 group relative">
-                      {item.success && "image_data" in item && item.image_data ? (
-                        <>
-                          <img
-                            src={"data:" + (item.content_type || "image/webp") + ";base64," + item.image_data}
-                            alt={item.name}
-                            className="w-full h-auto aspect-square object-cover"
-                          />
-                          <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <button
-                              onClick={() => downloadImage(item as AngleResult)}
-                              className="bg-white/20 backdrop-blur-sm rounded-lg p-2 hover:bg-white/30 transition-colors"
-                            >
-                              <Download className="h-5 w-5 text-white" />
-                            </button>
-                          </div>
-                        </>
-                        ) : !isPending(item) && item.error ? (
-                          <div className="w-full aspect-square flex items-center justify-center bg-gray-800">
-                            <button
-                              onClick={() => retryAngle(item.name)}
-                              disabled={retryingAngle === item.name}
-                              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-red-600/80 text-white hover:bg-red-500 transition-colors disabled:opacity-50"
-                            >
-                              {retryingAngle === item.name ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                <RotateCcw className="h-4 w-4" />
-                              )}
-                              Retry
-                            </button>
-                          </div>
-                      ) : (
-                        <div className="w-full aspect-square flex items-center justify-center">
-                          <Loader2 className="h-6 w-6 animate-spin text-gray-500" />
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                <div className="flex flex-col items-center justify-center h-64 text-gray-600">
+                  <ImageIcon className="h-16 w-16 mb-4 opacity-30" />
+                  <p className="text-gray-400 font-medium">No image generated yet</p>
+                  <p className="text-gray-500 text-sm mt-1">Upload an image and click Generate to start</p>
                 </div>
               )}
             </div>
@@ -838,7 +795,7 @@ function App() {
 
       <footer className="border-t border-gray-800/50 mt-12 py-6 text-center">
         <p className="text-gray-500 text-sm">AI NADIR ANGLE</p>
-        <p className="text-gray-600 text-xs mt-1">&copy; 2026 Multi-Angle Image Generator</p>
+        <p className="text-gray-600 text-xs mt-1">&copy; 2026 AI Camera Angle Generator</p>
       </footer>
     </div>
   );
